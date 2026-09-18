@@ -4,14 +4,17 @@
 //! from a shell on the box: make an invite, see the devices, shut one out, take
 //! a backup.
 
+use axum_server::tls_rustls::RustlsConfig;
+use axum_server::Handle;
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use uuid::Uuid;
 use uwussh_server::api;
+use uwussh_server::config::TlsMode;
 use uwussh_server::db::{accounts, devices, invites, records, Db};
-use uwussh_server::{now_ms, AppState, Config};
+use uwussh_server::{now_ms, tls, AppState, Config};
 
 #[derive(Parser)]
 #[command(name = "uwussh-server", version, about = "Sync server for UwUSSH")]
@@ -32,6 +35,9 @@ enum Command {
     Devices { account: Uuid },
     /// Shut a device out.
     Revoke { device: Uuid },
+    /// Print the fingerprint of this server certificate, which is what a
+    /// device pins.
+    Fingerprint,
     /// Write a consistent copy of the database.
     Backup {
         /// Where to write it. The default is a dated file under `backups`.
@@ -60,8 +66,17 @@ fn main() -> Result<(), String> {
                 invites::create_invite(&conn, invites::INVITE_TTL_MS)
                     .map_err(|error| error.to_string())?
             };
+            let fingerprint = match config.tls {
+                TlsMode::Auto => {
+                    Some(tls::fingerprint_of(&config.data_dir).map_err(|error| error.to_string())?)
+                }
+                TlsMode::Off => None,
+            };
             println!("Invite code: {code}");
-            println!("Setup code:  {}", setup_code(&config, &code));
+            println!(
+                "Setup code:  {}",
+                setup_code(&config, &code, fingerprint.as_deref())
+            );
             println!("Good for a week, and for one account.");
             Ok(())
         }
@@ -116,6 +131,21 @@ fn main() -> Result<(), String> {
             );
             Ok(())
         }
+        Command::Fingerprint => {
+            match config.tls {
+                TlsMode::Auto => {
+                    let fingerprint =
+                        tls::fingerprint_of(&config.data_dir).map_err(|error| error.to_string())?;
+                    println!("{fingerprint}");
+                    println!("{}", config.base_url());
+                    println!("A device pins this on the first connection, like an SSH host key.");
+                }
+                TlsMode::Off => {
+                    println!("UWUSSH_TLS is off: the certificate belongs to whatever is in front.")
+                }
+            }
+            Ok(())
+        }
         Command::Backup { to } => {
             let path = to.unwrap_or_else(|| {
                 config
@@ -131,6 +161,19 @@ fn main() -> Result<(), String> {
 
 #[tokio::main]
 async fn serve(db: Db, config: Config) -> Result<(), String> {
+    // The certificate first: its fingerprint belongs in the setup code, and a
+    // key that cannot be written is a reason not to start at all.
+    let identity = match config.tls {
+        TlsMode::Auto => Some(
+            tls::load_or_create(&config.data_dir, &tls::names_for(config.public.as_deref()))
+                .map_err(|error| format!("certificate: {error}"))?,
+        ),
+        TlsMode::Off => None,
+    };
+    let fingerprint = identity
+        .as_ref()
+        .map(|identity| identity.fingerprint.clone());
+
     // A server nobody can join is not much use, so the first start says how.
     if accounts::count(&db.lock()).unwrap_or(0) == 0
         && invites::count_open_invites(&db.lock()).unwrap_or(0) == 0
@@ -141,27 +184,59 @@ async fn serve(db: Db, config: Config) -> Result<(), String> {
                 .map_err(|error| error.to_string())?
         };
         tracing::info!("no accounts yet — here is the setup code for the first device:");
-        tracing::info!("    {}", setup_code(&config, &code));
+        tracing::info!("    {}", setup_code(&config, &code, fingerprint.as_deref()));
         tracing::info!("paste it into UwUSSH under Settings → Sync. It is good for a week.");
     }
 
     let listen = config.listen;
+    let url = config.base_url();
     let state = AppState::new(db, config);
     maintenance(state.clone());
+    let app = api::router(state).into_make_service_with_connect_info::<SocketAddr>();
 
-    let app = api::router(state);
-    let listener = tokio::net::TcpListener::bind(listen)
-        .await
-        .map_err(|error| format!("cannot listen on {listen}: {error}"))?;
-    tracing::info!(%listen, "UwUSSH sync server ready");
+    match identity {
+        Some(identity) => {
+            // `ring` rather than the default provider: it needs no C toolchain,
+            // so this builds the same everywhere.
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .map_err(|_| "could not set up TLS".to_string())?;
+            let tls = RustlsConfig::from_pem(
+                identity.cert_pem.into_bytes(),
+                identity.key_pem.into_bytes(),
+            )
+            .await
+            .map_err(|error| format!("certificate: {error}"))?;
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown())
-    .await
-    .map_err(|error| error.to_string())
+            let handle = Handle::new();
+            tokio::spawn({
+                let handle = handle.clone();
+                async move {
+                    shutdown().await;
+                    handle.graceful_shutdown(Some(Duration::from_secs(5)));
+                }
+            });
+            tracing::info!(%listen, %url, fingerprint = %identity.fingerprint, "UwUSSH sync server ready");
+            axum_server::bind_rustls(listen, tls)
+                .handle(handle)
+                .serve(app)
+                .await
+                .map_err(|error| error.to_string())
+        }
+        None => {
+            let listener = tokio::net::TcpListener::bind(listen)
+                .await
+                .map_err(|error| format!("cannot listen on {listen}: {error}"))?;
+            tracing::warn!(
+                %listen, %url,
+                "serving plain HTTP — put a reverse proxy with a certificate in front"
+            );
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown())
+                .await
+                .map_err(|error| error.to_string())
+        }
+    }
 }
 
 async fn shutdown() {
@@ -254,15 +329,15 @@ fn keep_newest(dir: &std::path::Path, keep: usize) {
     }
 }
 
-/// One setup code to paste: where the server is, and the invite. When the
-/// server brings its own certificate, its fingerprint goes in here too, so a
-/// first device pins it the way an SSH client pins a host key.
-fn setup_code(config: &Config, invite: &str) -> String {
-    let host = config
-        .public
-        .clone()
-        .unwrap_or_else(|| config.listen.to_string());
-    let body = serde_json::json!({ "h": host, "i": invite });
+/// One setup code to paste: where the server is, its certificate fingerprint,
+/// and the invite. The fingerprint is the part that matters — the first device
+/// pins it the way an SSH client pins a host key, and passes it on to every
+/// device that pairs with it afterwards.
+fn setup_code(config: &Config, invite: &str, fingerprint: Option<&str>) -> String {
+    let mut body = serde_json::json!({ "u": config.base_url(), "i": invite });
+    if let Some(fingerprint) = fingerprint {
+        body["f"] = serde_json::json!(fingerprint);
+    }
     format!("uwu1_{}", uwussh_server::b64::encode(body.to_string()))
 }
 
@@ -294,26 +369,44 @@ mod tests {
         assert_eq!(date(1_789_000_000_000), "2026-09-10");
     }
 
+    fn decode(code: &str) -> serde_json::Value {
+        assert!(code.starts_with("uwu1_"), "{code}");
+        let decoded = uwussh_server::b64::decode(&code["uwu1_".len()..]).unwrap();
+        serde_json::from_slice(&decoded).unwrap()
+    }
+
     #[test]
-    fn a_setup_code_carries_the_address_and_the_invite() {
+    fn a_setup_code_carries_the_address_the_fingerprint_and_the_invite() {
         let config = Config {
             public: Some("nas.lan:8443".into()),
             ..Config::default()
         };
-        let code = setup_code(&config, "ABCDE-FGHJK-MNPQR");
-        assert!(code.starts_with("uwu1_"));
-        let decoded = uwussh_server::b64::decode(&code["uwu1_".len()..]).unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
-        assert_eq!(parsed["h"], "nas.lan:8443");
+        let parsed = decode(&setup_code(
+            &config,
+            "ABCDE-FGHJK-MNPQR",
+            Some("SHA256:abc"),
+        ));
+        assert_eq!(parsed["u"], "https://nas.lan:8443");
+        assert_eq!(parsed["f"], "SHA256:abc");
         assert_eq!(parsed["i"], "ABCDE-FGHJK-MNPQR");
     }
 
     #[test]
+    fn without_its_own_certificate_there_is_nothing_to_pin() {
+        let config = Config {
+            tls: TlsMode::Off,
+            public: Some("https://uwussh.example.com".into()),
+            ..Config::default()
+        };
+        let parsed = decode(&setup_code(&config, "X", None));
+        assert_eq!(parsed["u"], "https://uwussh.example.com");
+        assert!(parsed.get("f").is_none(), "{parsed}");
+    }
+
+    #[test]
     fn a_setup_code_falls_back_to_where_the_server_listens() {
-        let code = setup_code(&Config::default(), "X");
-        let decoded = uwussh_server::b64::decode(&code["uwu1_".len()..]).unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
-        assert_eq!(parsed["h"], "0.0.0.0:8443");
+        let parsed = decode(&setup_code(&Config::default(), "X", None));
+        assert_eq!(parsed["u"], "https://0.0.0.0:8443");
     }
 
     #[test]

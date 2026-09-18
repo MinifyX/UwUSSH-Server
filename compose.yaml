@@ -16,5 +16,9 @@ services:
       # open | invite | closed. With `invite`, the first start writes a setup
       # code to the log: docker compose logs uwussh
       UWUSSH_REGISTRATION: invite
-      # Only behind a reverse proxy that sets X-Forwarded-For.
-      # UWUSSH_TRUST_FORWARDED: "1"
+      # auto: the server makes its own certificate and tells you the
+      # fingerprint your devices pin. Turn it off when something in front
+      # already does the TLS — and then believe that proxy's header:
+      # UWUSSH_TLS: 'off'
+      # UWUSSH_TRUST_FORWARDED: '1'
+      UWUSSH_TLS: auto

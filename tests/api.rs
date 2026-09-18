@@ -748,3 +748,255 @@ async fn guessing_is_slowed_down() {
     }
     assert!(refused, "a guesser must run into a wall");
 }
+
+// ── Pairing ──────────────────────────────────────────────────────────────────
+//
+// The server carries messages between two devices and understands none of
+// them. What is checked here is that it carries them to the right side, that
+// it cannot be used for anything else, and that a session is over when it is
+// over.
+
+#[tokio::test]
+async fn two_devices_hand_a_secret_through_the_relay() {
+    let server = start(Registration::Open).await;
+    let first = Device::create_account(&server, "", "master", 1).await;
+
+    let opened: serde_json::Value = server
+        .client
+        .post(server.url("/v1/pair"))
+        .bearer_auth(&first.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = opened["id"].as_str().unwrap().to_string();
+    assert_eq!(id.len(), 5, "a code somebody reads out loud");
+
+    let post = |side: &'static str, message: &'static [u8]| {
+        server
+            .client
+            .post(server.url(&format!("/v1/pair/{id}")))
+            .json(&json!({ "side": side, "message": uwussh_server::b64::encode(message) }))
+            .send()
+    };
+    let read = |side: &'static str, after: usize| {
+        server
+            .client
+            .get(server.url(&format!("/v1/pair/{id}?side={side}&after={after}")))
+            .send()
+    };
+
+    // The handshake: one message each way, then the sealed payload.
+    assert_eq!(post("a", b"spake from a").await.unwrap().status(), 204);
+
+    let mine: serde_json::Value = read("a", 0).await.unwrap().json().await.unwrap();
+    assert!(
+        mine["messages"].as_array().unwrap().is_empty(),
+        "a device does not read its own message back"
+    );
+
+    let theirs: serde_json::Value = read("b", 0).await.unwrap().json().await.unwrap();
+    assert_eq!(
+        theirs["messages"][0],
+        uwussh_server::b64::encode(b"spake from a")
+    );
+    assert_eq!(theirs["next"], 1);
+
+    assert_eq!(post("b", b"spake from b").await.unwrap().status(), 204);
+    assert_eq!(
+        post("a", b"sealed account key").await.unwrap().status(),
+        204
+    );
+
+    let theirs: serde_json::Value = read("b", 1).await.unwrap().json().await.unwrap();
+    assert_eq!(
+        theirs["messages"][0],
+        uwussh_server::b64::encode(b"sealed account key"),
+        "and only what it has not seen yet"
+    );
+
+    // Finished: the device that opened it says so.
+    let closed = server
+        .client
+        .delete(server.url(&format!("/v1/pair/{id}")))
+        .bearer_auth(&first.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(closed.status(), 204);
+    assert_eq!(read("b", 0).await.unwrap().status(), 404);
+}
+
+#[tokio::test]
+async fn a_waiting_device_is_woken_when_the_other_speaks() {
+    let server = start(Registration::Open).await;
+    let first = Device::create_account(&server, "", "master", 1).await;
+    let opened: serde_json::Value = server
+        .client
+        .post(server.url("/v1/pair"))
+        .bearer_auth(&first.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = opened["id"].as_str().unwrap().to_string();
+
+    let waiting = server
+        .client
+        .get(server.url(&format!("/v1/pair/{id}?side=b&after=0&wait=true")))
+        .send();
+    let speaking = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        server
+            .client
+            .post(server.url(&format!("/v1/pair/{id}")))
+            .json(&json!({ "side": "a", "message": uwussh_server::b64::encode(b"at last") }))
+            .send()
+            .await
+            .unwrap()
+    };
+
+    let (answer, _) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), both(waiting, speaking))
+            .await
+            .expect("the wait ends when the message arrives");
+
+    let body: serde_json::Value = answer.unwrap().json().await.unwrap();
+    assert_eq!(body["messages"][0], uwussh_server::b64::encode(b"at last"));
+}
+
+/// `tokio::join!` as a function, so both halves can be put under one timeout.
+async fn both<A: std::future::Future, B: std::future::Future>(
+    a: A,
+    b: B,
+) -> (A::Output, B::Output) {
+    tokio::join!(a, b)
+}
+
+#[tokio::test]
+async fn the_relay_is_a_handshake_and_not_storage() {
+    let server = start(Registration::Open).await;
+    let first = Device::create_account(&server, "", "master", 1).await;
+    let opened: serde_json::Value = server
+        .client
+        .post(server.url("/v1/pair"))
+        .bearer_auth(&first.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = opened["id"].as_str().unwrap().to_string();
+    let post = |message: String| {
+        server
+            .client
+            .post(server.url(&format!("/v1/pair/{id}")))
+            .json(&json!({ "side": "a", "message": message }))
+            .send()
+    };
+
+    assert_eq!(
+        post(uwussh_server::b64::encode(vec![0u8; 9 * 1024]))
+            .await
+            .unwrap()
+            .status(),
+        413,
+        "a handshake message is small"
+    );
+    assert_eq!(post(String::new()).await.unwrap().status(), 400);
+    assert_eq!(
+        post("not base64 at all !!".into()).await.unwrap().status(),
+        400
+    );
+
+    for _ in 0..4 {
+        assert_eq!(
+            post(uwussh_server::b64::encode(b"fine"))
+                .await
+                .unwrap()
+                .status(),
+            204
+        );
+    }
+    assert_eq!(
+        post(uwussh_server::b64::encode(b"one too many"))
+            .await
+            .unwrap()
+            .status(),
+        400,
+        "and there are only so many of them"
+    );
+
+    // A side nobody named is not a side.
+    let bad_side = server
+        .client
+        .post(server.url(&format!("/v1/pair/{id}")))
+        .json(&json!({ "side": "c", "message": uwussh_server::b64::encode(b"x") }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_side.status(), 400);
+}
+
+#[tokio::test]
+async fn a_session_nobody_opened_is_not_there_and_not_everyones_to_close() {
+    let server = start(Registration::Open).await;
+    let mine = Device::create_account(&server, "", "master", 1).await;
+    let theirs = Device::create_account(&server, "", "other", 2).await;
+
+    // Opening one needs a device that is already in.
+    let anonymous = server
+        .client
+        .post(server.url("/v1/pair"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), 401);
+
+    let opened: serde_json::Value = server
+        .client
+        .post(server.url("/v1/pair"))
+        .bearer_auth(&mine.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = opened["id"].as_str().unwrap().to_string();
+
+    // Another account cannot close it, and is not told that it exists.
+    let stranger = server
+        .client
+        .delete(server.url(&format!("/v1/pair/{id}")))
+        .bearer_auth(&theirs.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stranger.status(), 404);
+
+    let unknown = server
+        .client
+        .get(server.url("/v1/pair/ZZZZZ?side=b"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), 404);
+
+    // It is still there for the account that opened it.
+    assert_eq!(
+        server
+            .client
+            .get(server.url(&format!("/v1/pair/{id}?side=b")))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+}

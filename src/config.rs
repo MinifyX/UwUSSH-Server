@@ -7,6 +7,26 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+/// Whether the server brings its own certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsMode {
+    /// Make one, keep the key, and say what its fingerprint is. The client
+    /// pins that, the way it pins an SSH host key.
+    Auto,
+    /// Speak plain HTTP, because something in front does the TLS.
+    Off,
+}
+
+impl TlsMode {
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value.trim().to_ascii_lowercase().as_str() {
+            "auto" | "on" | "1" | "true" => Self::Auto,
+            "off" | "0" | "false" | "proxy" => Self::Off,
+            _ => return None,
+        })
+    }
+}
+
 /// Who may create an account on this server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Registration {
@@ -40,6 +60,7 @@ pub struct Config {
     /// a server behind a name or a proxy is told.
     pub public: Option<String>,
     pub registration: Registration,
+    pub tls: TlsMode,
     /// Trust `X-Forwarded-For` for the address rate limits are counted per.
     /// Only ever true behind a proxy that sets it, or anyone can pretend to be
     /// someone else.
@@ -55,6 +76,7 @@ impl Default for Config {
             listen: "0.0.0.0:8443".parse().expect("a literal address"),
             public: None,
             registration: Registration::Invite,
+            tls: TlsMode::Auto,
             trust_forwarded: false,
             session_secs: 60 * 60,
         }
@@ -82,6 +104,10 @@ impl Config {
                 format!("UWUSSH_REGISTRATION must be open, invite or closed: {registration}")
             })?;
         }
+        if let Some(tls) = var("UWUSSH_TLS") {
+            config.tls = TlsMode::parse(&tls)
+                .ok_or_else(|| format!("UWUSSH_TLS must be auto or off: {tls}"))?;
+        }
         if let Some(trust) = var("UWUSSH_TRUST_FORWARDED") {
             config.trust_forwarded = matches!(trust.as_str(), "1" | "true" | "yes");
         }
@@ -100,6 +126,20 @@ impl Config {
     pub fn backups(&self) -> PathBuf {
         self.data_dir.join("backups")
     }
+
+    /// How a device writes this server down: the scheme follows whether the
+    /// server does its own TLS, unless the address already says.
+    pub fn base_url(&self) -> String {
+        let scheme = match self.tls {
+            TlsMode::Auto => "https",
+            TlsMode::Off => "http",
+        };
+        match &self.public {
+            Some(public) if public.contains("://") => public.trim_end_matches('/').to_string(),
+            Some(public) => format!("{scheme}://{public}"),
+            None => format!("{scheme}://{}", self.listen),
+        }
+    }
 }
 
 fn var(name: &str) -> Option<String> {
@@ -115,8 +155,33 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.listen.port(), 8443);
         assert_eq!(config.registration, Registration::Invite);
+        assert_eq!(config.tls, TlsMode::Auto, "secure without being asked");
         assert!(!config.trust_forwarded, "off unless a proxy is in front");
         assert_eq!(config.database().file_name().unwrap(), "uwussh.db");
+    }
+
+    #[test]
+    fn the_address_a_device_writes_down_says_how_to_reach_it() {
+        let plain = Config {
+            tls: TlsMode::Off,
+            public: Some("nas.lan:8443".into()),
+            ..Config::default()
+        };
+        assert_eq!(plain.base_url(), "http://nas.lan:8443");
+
+        let secure = Config {
+            public: Some("nas.lan:8443".into()),
+            ..Config::default()
+        };
+        assert_eq!(secure.base_url(), "https://nas.lan:8443");
+        assert_eq!(Config::default().base_url(), "https://0.0.0.0:8443");
+
+        let proxied = Config {
+            tls: TlsMode::Off,
+            public: Some("https://uwussh.example.com/".into()),
+            ..Config::default()
+        };
+        assert_eq!(proxied.base_url(), "https://uwussh.example.com");
     }
 
     #[test]

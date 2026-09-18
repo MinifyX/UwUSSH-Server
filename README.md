@@ -30,9 +30,10 @@ services:
 docker compose up -d && docker compose logs uwussh
 ```
 
-The first start writes a **setup code** to the log — one string carrying the
-address and an invite. Paste it into UwUSSH under Settings → Sync, type your
-master password once, and that device is in. Later ones get another code:
+The first start makes itself a certificate and writes a **setup code** to the
+log — one string carrying the address, the certificate's fingerprint and an
+invite. Paste it into UwUSSH under Settings → Sync, type your master password
+once, and that device is in. Later ones get another code:
 
 ```bash
 docker compose exec uwussh uwussh-server invite
@@ -44,11 +45,18 @@ folder (`UWUSSH_DATA`, `./data` by default) and nothing else.
 ## Adding a second device
 
 Not by typing an address and a password on the new device. The device that is
-already in shows a short code; the new one types it; the two agree on a key the
-server cannot derive, and through that channel the first device passes what the
-second needs — including a one-time enrolment token. The new device then proves
-it knows the master password, and only then does the server hand over the
-wrapped vault key.
+already in shows a short code; the new one types it; the two run SPAKE2 — a
+handshake where a spoken code turns into a strong shared key — and agree on
+something this server cannot derive. Through that channel the first device
+passes what the second needs: the certificate fingerprint to pin, the account
+key, and a one-time enrolment token. The new device then proves it knows the
+master password, and only then does the server hand over the wrapped vault key.
+
+This server is the post box for that handshake and nothing more. It carries
+opaque messages between the two sides — at most a handful, at most a few
+kilobytes each, for ten minutes — and never learns the code. Somebody who
+guesses a session id still has to guess the code, and SPAKE2 gives them exactly
+one attempt at it.
 
 Two secrets, and neither is enough on its own: an intercepted code is worth
 nothing without the password, and the password is worth nothing without a
@@ -81,24 +89,26 @@ guessing the master password against it.
 
 ## Configuration
 
-| Variable                 | Default        | What it does                                                      |
-| ------------------------ | -------------- | ----------------------------------------------------------------- |
-| `UWUSSH_DATA`            | `./data`       | Database, and backups under `backups/`                            |
-| `UWUSSH_LISTEN`          | `0.0.0.0:8443` | Address to listen on                                              |
-| `UWUSSH_PUBLIC`          | the listen address | How devices reach this server; goes into the setup code       |
-| `UWUSSH_REGISTRATION`    | `invite`       | `open`, `invite` or `closed`                                      |
-| `UWUSSH_TRUST_FORWARDED` | off            | Believe `X-Forwarded-For` — only behind a proxy that sets it      |
-| `UWUSSH_SESSION_SECS`    | `3600`         | How long a device's token lasts before it signs a challenge again |
+| Variable                 | Default            | What it does                                                      |
+| ------------------------ | ------------------ | ----------------------------------------------------------------- |
+| `UWUSSH_DATA`            | `./data`           | Database, certificate key, and backups under `backups/`            |
+| `UWUSSH_LISTEN`          | `0.0.0.0:8443`     | Address to listen on                                              |
+| `UWUSSH_PUBLIC`          | the listen address | How devices reach this server; goes into the setup code           |
+| `UWUSSH_TLS`             | `auto`             | `auto` for its own certificate, `off` when a proxy does the TLS    |
+| `UWUSSH_REGISTRATION`    | `invite`           | `open`, `invite` or `closed`                                      |
+| `UWUSSH_TRUST_FORWARDED` | off                | Believe `X-Forwarded-For` — only behind a proxy that sets it      |
+| `UWUSSH_SESSION_SECS`    | `3600`             | How long a device's token lasts before it signs a challenge again |
 
 ## The commands
 
 ```
-uwussh-server              serve (the default)
-uwussh-server invite       a code for one new account, good for a week
-uwussh-server accounts     what is on this server, and how many devices each has
-uwussh-server devices <id> the devices of an account
-uwussh-server revoke <id>  shut a device out
-uwussh-server backup       a consistent copy, right now
+uwussh-server               serve (the default)
+uwussh-server invite        a code for one new account, good for a week
+uwussh-server fingerprint   what a device pins, to compare by eye
+uwussh-server accounts      what is on this server, and how many devices each has
+uwussh-server devices <id>  the devices of an account
+uwussh-server revoke <id>   shut a device out
+uwussh-server backup        a consistent copy, right now
 ```
 
 Backups run by themselves too: one a night, fourteen kept, written with
@@ -107,7 +117,7 @@ its write-ahead log, which is a backup that looks fine until you need it.
 
 ## The protocol
 
-Nine endpoints. The types come from
+The whole surface. The types come from
 [`uwussh-proto`](https://github.com/MinifyX/UwUSSH-Client/tree/main/crates/uwussh-proto),
 the same crate the client uses, so a schema change is one edit in one place.
 
@@ -120,22 +130,35 @@ the same crate the client uses, so a schema change is one edit in one place.
 | `GET /v1/records`, `POST /v1/records`        | Pull from a cursor, push with a version               |
 | `GET /v1/events`                             | "There is something new from N" (server-sent events)  |
 | `GET /v1/devices`, `POST /v1/devices/invite`, `POST /v1/devices/enrol`, `DELETE /v1/devices/{id}` | Devices: list, let one in, shut one out |
+| `POST /v1/pair`, `GET`/`POST`/`DELETE /v1/pair/{id}` | The post box two devices pair through           |
 | `GET /healthz`                               | Alive, and what schema it speaks                      |
 
 Limits it enforces without a key: 500 records per request, 256 KiB per record,
-16 MiB per request, and rate limits on the three endpoints where guessing would
-pay.
+16 MiB per request, a handful of small messages per pairing — and rate limits
+on every endpoint where guessing or hammering would pay.
 
 ## TLS
 
-**Not yet.** Put it behind a reverse proxy with a real certificate for now
-(Caddy, Traefik, nginx) and set `UWUSSH_TRUST_FORWARDED=1`. The client refuses
-plain HTTP to anything but localhost.
+The server makes its own certificate on first start and says what its
+fingerprint is. The setup code carries it, the client pins it, and every device
+that pairs later is told it through the handshake — the same thing an SSH
+client does with a host key, for the same reason. No domain, no Let's Encrypt,
+works over a Tailscale address:
 
-The next step is `UWUSSH_TLS=auto`: a certificate the server makes for itself on
-first start, whose fingerprint goes into the setup code and is pinned by the
-client — the same thing an SSH client does with a host key, and no domain
-needed.
+```bash
+docker compose exec uwussh uwussh-server fingerprint
+# SHA256:ulfTn6S7NU3WLo3YpGCLPYmpbGfwIQbmvTJDOH421Ok
+```
+
+**What is pinned is the key, not the certificate.** The fingerprint is a
+SHA-256 of the public key, so the certificate itself is made fresh at every
+start — new dates, new names, same fingerprint — and nothing a device pinned
+ever expires out from under it. Only the private key is kept, in
+`tls/key.pem`, readable by nobody else.
+
+Already have a real certificate? Set `UWUSSH_TLS=off`, put Caddy, Traefik or
+nginx in front, and add `UWUSSH_TRUST_FORWARDED=1` so the rate limits count the
+device's address rather than the proxy's.
 
 ## Building on it
 

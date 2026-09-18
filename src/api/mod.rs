@@ -1,7 +1,8 @@
-//! The HTTP surface. Nine endpoints, and not one of them can read a record.
+//! The HTTP surface. Not one endpoint on it can read a record.
 
 pub mod accounts;
 pub mod devices;
+pub mod pairing;
 pub mod records;
 pub mod session;
 
@@ -36,6 +37,13 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/devices/invite", post(devices::invite))
         .route("/v1/devices/enrol", post(devices::enrol))
         .route("/v1/devices/{id}", delete(devices::revoke))
+        .route("/v1/pair", post(pairing::open))
+        .route(
+            "/v1/pair/{id}",
+            get(pairing::read)
+                .post(pairing::post)
+                .delete(pairing::close),
+        )
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
         .with_state(state)

@@ -41,6 +41,23 @@ pub const ENROL: Bucket = Bucket {
     window: Duration::from_secs(10 * 60),
 };
 
+/// Pairing is a handshake of a few messages, and the devices wait rather than
+/// ask again — but they do wait in a loop, so this one is roomier.
+pub const PAIR: Bucket = Bucket {
+    name: "pair",
+    max: 60,
+    window: Duration::from_secs(10 * 60),
+};
+
+fn window_of(name: &str) -> Duration {
+    match name {
+        "accounts" => ACCOUNTS.window,
+        "enrol" => ENROL.window,
+        "pair" => PAIR.window,
+        _ => SESSION.window,
+    }
+}
+
 /// When each address last tried, per bucket.
 type Hits = HashMap<(String, &'static str), Vec<Instant>>;
 
@@ -57,11 +74,7 @@ impl RateLimiter {
         // Forget what has fallen out of every window, or a server that runs
         // for months keeps an entry per address that ever knocked.
         inner.retain(|(_, name), hits| {
-            let window = match *name {
-                "accounts" => ACCOUNTS.window,
-                "enrol" => ENROL.window,
-                _ => SESSION.window,
-            };
+            let window = window_of(name);
             hits.retain(|hit| now.duration_since(*hit) < window);
             !hits.is_empty()
         });

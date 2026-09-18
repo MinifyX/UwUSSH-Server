@@ -3,6 +3,7 @@
 use crate::auth::{Challenges, Sessions};
 use crate::db::Db;
 use crate::limits::RateLimiter;
+use crate::pairing::Pairings;
 use crate::Config;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -19,6 +20,7 @@ pub struct AppState {
     pub challenges: Challenges,
     pub limits: RateLimiter,
     pub events: Events,
+    pub pairings: Pairings,
 }
 
 impl AppState {
@@ -30,6 +32,7 @@ impl AppState {
             challenges: Challenges::default(),
             limits: RateLimiter::default(),
             events: Events::default(),
+            pairings: Pairings::default(),
         }
     }
 }

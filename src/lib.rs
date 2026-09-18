@@ -20,7 +20,9 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod limits;
+pub mod pairing;
 pub mod state;
+pub mod tls;
 
 pub use config::Config;
 pub use error::{ApiError, Result};
