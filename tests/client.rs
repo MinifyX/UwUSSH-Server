@@ -34,13 +34,17 @@ struct Running {
 }
 
 fn start() -> Running {
+    start_with(Registration::Open)
+}
+
+fn start_with(registration: Registration) -> Running {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let (ready, started) = mpsc::channel();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("a runtime");
         runtime.block_on(async move {
             let config = Config {
-                registration: Registration::Open,
+                registration,
                 ..Config::default()
             };
             let state = AppState::new(Db::open_in_memory().expect("a database"), config);
@@ -298,4 +302,164 @@ fn a_client_pointed_at_the_wrong_thing_says_so_rather_than_trying() {
     let running = start();
     let stranger = Server::connect(&running.url, None).unwrap();
     assert!(stranger.devices().is_err());
+}
+
+// ── The whole thing, as a person does it ────────────────────────────────────
+
+/// Sealing for this device, as the operating system would. A test has no
+/// DPAPI, and what matters here is that the same bytes come back.
+fn protect(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+    Ok(bytes.iter().map(|byte| byte ^ 0x5a).collect())
+}
+
+fn unprotect(bytes: &[u8]) -> std::io::Result<zeroize::Zeroizing<Vec<u8>>> {
+    Ok(zeroize::Zeroizing::new(
+        bytes.iter().map(|byte| byte ^ 0x5a).collect(),
+    ))
+}
+
+/// The setup code the server prints, built the way `uwussh-server invite`
+/// builds it.
+fn setup_code(running: &Running) -> uwussh_sync::Setup {
+    let invite = {
+        let conn = running.state.db.lock();
+        uwussh_server::db::invites::create_invite(&conn, 60_000).unwrap()
+    };
+    let body = serde_json::json!({ "u": running.url, "i": invite }).to_string();
+    let code = format!("uwu1_{}", b64::encode(body));
+    uwussh_sync::parse_setup(&code).expect("the server's own code")
+}
+
+#[test]
+fn a_second_device_joins_by_reading_out_three_words() {
+    let running = start_with(Registration::Invite);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+
+    // ── The first device: a setup code, a master password, and that is all ──
+    let first = std::sync::Arc::new(Store::open_in_memory().unwrap());
+    // It already has a host, from before there was ever a server.
+    first.create_vault_with(PASSWORD, KDF).unwrap();
+    let mut prox = host("prox-1", "10.0.0.12");
+    prox.password = PasswordChange::Set {
+        value: SecretText::new("hunter2"),
+    };
+    let saved = first.save_host(prox).unwrap();
+
+    let setup = setup_code(&running);
+    let (server, paired) =
+        uwussh_sync::create_account(&first, &setup, PASSWORD, "LVDesk1", protect).unwrap();
+    let kit = paired.recovery.expect("the recovery kit, shown once");
+    assert_eq!(
+        first.reveal_host_password(saved.id).unwrap().as_slice(),
+        b"hunter2",
+        "turning sync on wrapped one key again and re-encrypted nothing"
+    );
+    assert!(
+        first.vault_needs_account_key().unwrap(),
+        "and the vault now wants the kit as well"
+    );
+    sync_once(&first, &server).unwrap();
+
+    // ── The code, as it goes on screen ─────────────────────────────────────
+    let offer = uwussh_sync::flow::offer_pairing(&first, &server).unwrap();
+    let spoken = offer.offer.spoken.clone();
+    let (id, words) = uwussh_sync::pairing::parse_spoken(&spoken).expect("a code to read out");
+    // The joining device is told the address and the fingerprint by the
+    // pasteable form; typing the spoken code needs the address as well, which
+    // is what the interface asks for.
+    let pasted = uwussh_sync::pairing::parse_offer(&offer.offer.pasteable).unwrap();
+    assert_eq!(pasted.id, id);
+    assert_eq!(pasted.words, words);
+
+    // ── The second device: the code and the master password ────────────────
+    let second = std::sync::Arc::new(Store::open_in_memory().unwrap());
+    let joining = {
+        let second = second.clone();
+        let target = pasted.clone();
+        std::thread::spawn(move || {
+            uwussh_sync::join(&second, &target, PASSWORD, "LVLaptop", protect, deadline)
+        })
+    };
+
+    let joined =
+        uwussh_sync::flow::wait_for_device(&first, &server, &offer, unprotect, deadline).unwrap();
+    assert_eq!(joined.device_name, "LVLaptop");
+
+    let (other, paired) = joining.join().unwrap().unwrap();
+    assert!(
+        paired.recovery.is_none(),
+        "only the device that made the key shows a kit"
+    );
+    assert_eq!(
+        Some(paired.account_id),
+        first.sync_state().unwrap().account_id,
+        "both devices are in the same account"
+    );
+
+    // It has the vault, and the vault wants the kit — which it has, because
+    // the handshake carried it.
+    assert!(second.vault_needs_account_key().unwrap());
+    sync_once(&second, &other).unwrap();
+    let hosts = second.list_hosts().unwrap();
+    assert_eq!(hosts.len(), 1);
+    assert_eq!(hosts[0].address, "10.0.0.12");
+    assert_eq!(
+        second.reveal_host_password(saved.id).unwrap().as_slice(),
+        b"hunter2",
+        "and the password opens on a device that was only ever told three words"
+    );
+
+    // Locked and opened again with what this device keeps: no kit typed.
+    second.lock_vault();
+    let key = uwussh_sync::flow::account_key(&second, unprotect)
+        .unwrap()
+        .expect("the account key this device kept");
+    second.unlock_vault_with(PASSWORD, Some(&key)).unwrap();
+    assert_eq!(
+        second.reveal_host_password(saved.id).unwrap().as_slice(),
+        b"hunter2"
+    );
+    // And the kit from the other device is the same key.
+    assert_eq!(key.to_code(), kit.to_code());
+
+    // Signing in again from scratch, the way tomorrow's first pass does.
+    let returning = uwussh_sync::reconnect(&second, unprotect).unwrap();
+    assert_eq!(sync_once(&second, &returning).unwrap().apply.rejected, 0);
+
+    // The account has two devices, and each can see them.
+    assert_eq!(server.devices().unwrap().len(), 2);
+    assert_eq!(other.devices().unwrap().len(), 2);
+}
+
+#[test]
+fn a_device_that_heard_the_wrong_words_gets_nothing() {
+    let running = start_with(Registration::Invite);
+    // Short: the handshake fails on the first answer, and the other side is
+    // only waiting for something that will never come.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let first = std::sync::Arc::new(Store::open_in_memory().unwrap());
+    let setup = setup_code(&running);
+    let (server, _) =
+        uwussh_sync::create_account(&first, &setup, PASSWORD, "LVDesk1", protect).unwrap();
+
+    let offer = uwussh_sync::flow::offer_pairing(&first, &server).unwrap();
+    let mut wrong = uwussh_sync::pairing::parse_offer(&offer.offer.pasteable).unwrap();
+    wrong.words = "tiger-tiger-tiger".into();
+
+    let second = std::sync::Arc::new(Store::open_in_memory().unwrap());
+    let joining = {
+        let second = second.clone();
+        std::thread::spawn(move || {
+            uwussh_sync::join(&second, &wrong, PASSWORD, "LVLaptop", protect, deadline)
+        })
+    };
+    assert!(
+        uwussh_sync::flow::wait_for_device(&first, &server, &offer, unprotect, deadline).is_err(),
+        "the handover must not happen"
+    );
+    assert!(joining.join().unwrap().is_err());
+
+    // The account still has one device, and the other store is untouched.
+    assert_eq!(server.devices().unwrap().len(), 1);
+    assert!(second.vault_header().unwrap().is_none());
 }

@@ -183,7 +183,12 @@ the account, over HTTP, through this server. The two repositories therefore
 cannot drift apart quietly: the shared types come from `uwussh-proto`, and one
 test fails the moment either half stops speaking the same protocol.
 
-It also checks the thing the whole design rests on, from the outside: with the
+It runs the pairing too, the whole way: one device shows a code, the other one
+is given only those three words, and it comes out with the account, the vault
+and a password that opens — while a device that heard the wrong words gets
+nothing at all, and the account still has one device afterwards.
+
+And it checks the thing the whole design rests on, from the outside: with the
 records on the server in front of it, none of them contains the hostname, the
 address, the group or the password that went in.
 
