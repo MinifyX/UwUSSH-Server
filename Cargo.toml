@@ -1,0 +1,47 @@
+[package]
+name = "uwussh-server"
+description = "Sync server for UwUSSH: an encrypted mailbox for hosts, keys and passwords"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+repository = "https://github.com/MinifyX/UwUSSH-Server"
+# Same floor as the client, so one protocol crate builds for both.
+rust-version = "1.89"
+
+[dependencies]
+# The wire format, the clock and the conflict rule, straight from the client:
+# one definition, so client and server cannot drift apart. Pinned to a commit —
+# `cargo update -p uwussh-proto` after bumping this is a deliberate act.
+uwussh-proto = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "0f557d3459f585b4d4632f6dae9dc2997fdb9d48" }
+
+axum = { version = "0.8", features = ["json"] }
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+# The one trait behind the event stream.
+futures-core = "0.3"
+# Signatures for device login. Pure Rust, no C toolchain.
+ed25519-dalek = "2"
+parking_lot = "0.12"
+rand = "0.8"
+# Bundled SQLite, so the server never depends on whichever libsqlite3 is around.
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower-http = { version = "0.6", features = ["limit", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+
+[dev-dependencies]
+# No TLS feature: the tests talk to a server on localhost over plain HTTP.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

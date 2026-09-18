@@ -1,0 +1,750 @@
+//! The server over real HTTP, driven the way a device drives it.
+//!
+//! Each test starts a server on a port of its own with a database in memory,
+//! then speaks the actual protocol: create an account, sign a challenge, push,
+//! pull, join a second device, revoke one. What is checked is both halves of
+//! the job — that a device which does everything right gets its records
+//! across, and that one which does not gets nowhere.
+
+use ed25519_dalek::{Signer, SigningKey};
+use serde_json::json;
+use std::net::SocketAddr;
+use uuid::Uuid;
+use uwussh_proto::{EntityKind, Envelope, Hlc, PullResponse, PushResponse, SCHEMA_VERSION};
+use uwussh_server::api;
+use uwussh_server::config::Registration;
+use uwussh_server::db::Db;
+use uwussh_server::{AppState, Config};
+
+/// A server on a port of its own, with nothing on disk.
+struct Server {
+    base: String,
+    state: AppState,
+    client: reqwest::Client,
+}
+
+async fn start(registration: Registration) -> Server {
+    let config = Config {
+        registration,
+        ..Config::default()
+    };
+    let state = AppState::new(Db::open_in_memory().unwrap(), config);
+    let app = api::router(state.clone());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    Server {
+        base: format!("http://{address}"),
+        state,
+        client: reqwest::Client::new(),
+    }
+}
+
+impl Server {
+    fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.base)
+    }
+
+    async fn invite(&self) -> String {
+        let conn = self.state.db.lock();
+        uwussh_server::db::invites::create_invite(&conn, 60_000).unwrap()
+    }
+
+    /// The vault header a device uploads. Its contents are opaque here — the
+    /// server never opens it, which is the point.
+    fn vault(vault_id: Uuid) -> serde_json::Value {
+        json!({
+            "vaultId": vault_id,
+            "kdfMemoryKib": 65536,
+            "kdfTimeCost": 3,
+            "kdfParallelism": 4,
+            "salt": "c2FsdHktc2FsdHktc2FsdA",
+            "wrappedNonce": "bm9uY2Utbm9uY2Utbm9uY2U",
+            "wrappedBlob": "d3JhcHBlZC12YXVsdC1rZXk",
+        })
+    }
+}
+
+/// A device: its key, its ids, and its token.
+struct Device {
+    signing: SigningKey,
+    account: Uuid,
+    id: Uuid,
+    token: String,
+    vault_id: Uuid,
+}
+
+/// The login key a device derives from the master password and the account
+/// key. Here it is just the password's stand-in — the server only ever sees
+/// these 32 bytes and stores their hash.
+fn login_key(password: &str) -> String {
+    let mut key = [0u8; 32];
+    for (slot, byte) in key.iter_mut().zip(password.bytes().cycle()) {
+        *slot = byte;
+    }
+    uwussh_server::b64::encode(key)
+}
+
+impl Device {
+    fn new_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    async fn create_account(server: &Server, invite: &str, password: &str, seed: u8) -> Device {
+        let signing = Self::new_key(seed);
+        let vault_id = Uuid::now_v7();
+        let response = server
+            .client
+            .post(server.url("/v1/accounts"))
+            .json(&json!({
+                "invite": invite,
+                "vault": Server::vault(vault_id),
+                "authKey": login_key(password),
+                "device": {
+                    "name": "LVDesk1",
+                    "publicKey": uwussh_server::b64::encode(signing.verifying_key().to_bytes()),
+                },
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{:?}", response.text().await);
+        let body: serde_json::Value = response.json().await.unwrap();
+        Device {
+            signing,
+            account: body["accountId"].as_str().unwrap().parse().unwrap(),
+            id: body["deviceId"].as_str().unwrap().parse().unwrap(),
+            token: body["token"].as_str().unwrap().to_string(),
+            vault_id,
+        }
+    }
+
+    /// Sign in again with the device key: challenge, signature, token.
+    async fn login(&mut self, server: &Server) -> reqwest::StatusCode {
+        let challenge: serde_json::Value = server
+            .client
+            .post(server.url("/v1/session/challenge"))
+            .json(&json!({ "deviceId": self.id }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let challenge =
+            uwussh_server::b64::decode(challenge["challenge"].as_str().unwrap()).unwrap();
+        let material = uwussh_server::auth::signing_material(self.account, self.id, &challenge);
+        let signature = self.signing.sign(&material).to_bytes();
+
+        let response = server
+            .client
+            .post(server.url("/v1/session"))
+            .json(&json!({
+                "deviceId": self.id,
+                "signature": uwussh_server::b64::encode(signature),
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        if status == 200 {
+            let body: serde_json::Value = response.json().await.unwrap();
+            self.token = body["token"].as_str().unwrap().to_string();
+        }
+        status
+    }
+
+    fn envelope(&self, id: Uuid, base_seq: u64, blob: &[u8]) -> Envelope {
+        Envelope {
+            id,
+            vault_id: self.vault_id,
+            kind: EntityKind::Host,
+            updated_at: Hlc::new(1_700_000_000_000, 0, 1),
+            base_seq,
+            deleted: false,
+            nonce: vec![7; 24],
+            blob: blob.to_vec(),
+            seq: None,
+        }
+    }
+
+    async fn push(&self, server: &Server, envelopes: &[Envelope]) -> PushResponse {
+        let response = server
+            .client
+            .post(server.url("/v1/records"))
+            .bearer_auth(&self.token)
+            .json(&json!({ "schema": SCHEMA_VERSION, "envelopes": envelopes }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{:?}", response.text().await);
+        response.json().await.unwrap()
+    }
+
+    async fn pull(&self, server: &Server, since: u64) -> PullResponse {
+        let response = server
+            .client
+            .get(server.url(&format!("/v1/records?since={since}")))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{:?}", response.text().await);
+        response.json().await.unwrap()
+    }
+}
+
+#[tokio::test]
+async fn a_device_creates_an_account_and_gets_its_records_across() {
+    let server = start(Registration::Invite).await;
+    let invite = server.invite().await;
+    let device = Device::create_account(&server, &invite, "master", 1).await;
+
+    let id = Uuid::now_v7();
+    let pushed = device
+        .push(&server, &[device.envelope(id, 0, b"sealed host")])
+        .await;
+    assert_eq!(pushed.accepted.len(), 1);
+    assert_eq!(pushed.accepted[0].seq, 1);
+
+    let page = device.pull(&server, 0).await;
+    assert_eq!(page.envelopes.len(), 1);
+    assert_eq!(page.envelopes[0].id, id);
+    assert_eq!(page.envelopes[0].blob, b"sealed host".to_vec());
+    assert!(!page.has_more);
+
+    // And the device can sign in again tomorrow with the key it enrolled.
+    let mut device = device;
+    assert_eq!(device.login(&server).await, 200);
+    assert_eq!(device.pull(&server, 0).await.envelopes.len(), 1);
+}
+
+#[tokio::test]
+async fn a_second_device_joins_with_a_token_and_the_master_password() {
+    let server = start(Registration::Invite).await;
+    let invite = server.invite().await;
+    let first = Device::create_account(&server, &invite, "master", 1).await;
+    let id = Uuid::now_v7();
+    first
+        .push(&server, &[first.envelope(id, 0, b"from the first")])
+        .await;
+
+    // The device that is already in makes a one-time token. In the real flow
+    // it travels to the other device through the pairing channel.
+    let enrolment: serde_json::Value = server
+        .client
+        .post(server.url("/v1/devices/invite"))
+        .bearer_auth(&first.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = enrolment["token"].as_str().unwrap().to_string();
+
+    // Before it can prove anything, the joining device needs the salt and the
+    // costs — and gets nothing it could attack offline.
+    let params: serde_json::Value = server
+        .client
+        .get(server.url(&format!("/v1/vault/params?enrolment={token}")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(params["salt"], "c2FsdHktc2FsdHktc2FsdA");
+    assert!(params.get("wrappedBlob").is_none(), "{params}");
+
+    let second_key = Device::new_key(2);
+    let second_public = uwussh_server::b64::encode(second_key.verifying_key().to_bytes());
+    let join = |password: &'static str| {
+        let body = json!({
+            "enrolment": token,
+            "authKey": login_key(password),
+            "device": { "name": "LVLaptop", "publicKey": second_public },
+        });
+        server
+            .client
+            .post(server.url("/v1/devices/enrol"))
+            .json(&body)
+            .send()
+    };
+
+    // The wrong master password gets nowhere — and does not burn the token.
+    assert_eq!(join("wrong").await.unwrap().status(), 401);
+
+    let response = join("master").await.unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let second = Device {
+        signing: second_key,
+        account: body["accountId"].as_str().unwrap().parse().unwrap(),
+        id: body["deviceId"].as_str().unwrap().parse().unwrap(),
+        token: body["token"].as_str().unwrap().to_string(),
+        vault_id: first.vault_id,
+    };
+    assert_eq!(second.account, first.account);
+
+    // Now it may have the wrapped key, and everything the first device wrote.
+    let header: serde_json::Value = server
+        .client
+        .get(server.url("/v1/vault"))
+        .bearer_auth(&second.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(header["wrappedBlob"], "d3JhcHBlZC12YXVsdC1rZXk");
+
+    let page = second.pull(&server, 0).await;
+    assert_eq!(page.envelopes.len(), 1);
+    assert_eq!(page.envelopes[0].blob, b"from the first".to_vec());
+
+    // The token was spent: nobody joins twice with it.
+    assert_eq!(join("master").await.unwrap().status(), 401);
+
+    // And both devices show up in the list.
+    let devices: serde_json::Value = server
+        .client
+        .get(server.url("/v1/devices"))
+        .bearer_auth(&first.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(devices.as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn two_devices_editing_one_record_meet_the_version_check() {
+    let server = start(Registration::Invite).await;
+    let invite = server.invite().await;
+    let first = Device::create_account(&server, &invite, "master", 1).await;
+
+    let id = Uuid::now_v7();
+    first.push(&server, &[first.envelope(id, 0, b"one")]).await;
+    first.push(&server, &[first.envelope(id, 1, b"two")]).await;
+
+    // A device still believing version 1 is current is refused, and told what
+    // the server holds instead.
+    let response = first
+        .push(&server, &[first.envelope(id, 1, b"three")])
+        .await;
+    assert!(response.accepted.is_empty());
+    assert_eq!(response.conflicts.len(), 1);
+    assert_eq!(response.conflicts[0].blob, b"two".to_vec());
+    assert_eq!(response.conflicts[0].seq, Some(2));
+
+    // Based on that, it goes through.
+    let response = first
+        .push(&server, &[first.envelope(id, 2, b"three")])
+        .await;
+    assert_eq!(response.accepted.len(), 1);
+}
+
+#[tokio::test]
+async fn nothing_reaches_anyone_who_did_not_sign() {
+    let server = start(Registration::Invite).await;
+    let invite = server.invite().await;
+    let device = Device::create_account(&server, &invite, "master", 1).await;
+
+    for token in ["", "not-a-token", &format!("{}x", device.token)] {
+        let response = server
+            .client
+            .get(server.url("/v1/records"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401, "with token {token:?}");
+    }
+    let response = server
+        .client
+        .get(server.url("/v1/records"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401, "and with no token at all");
+
+    // A signature by the wrong key is no signature.
+    let mut impostor = Device {
+        signing: Device::new_key(9),
+        account: device.account,
+        id: device.id,
+        token: String::new(),
+        vault_id: device.vault_id,
+    };
+    assert_eq!(impostor.login(&server).await, 401);
+
+    // Nor is one for a challenge that was already answered.
+    let challenge: serde_json::Value = server
+        .client
+        .post(server.url("/v1/session/challenge"))
+        .json(&json!({ "deviceId": device.id }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let raw = uwussh_server::b64::decode(challenge["challenge"].as_str().unwrap()).unwrap();
+    let material = uwussh_server::auth::signing_material(device.account, device.id, &raw);
+    let signature = uwussh_server::b64::encode(device.signing.sign(&material).to_bytes());
+    let replay = json!({ "deviceId": device.id, "signature": signature });
+
+    let first = server
+        .client
+        .post(server.url("/v1/session"))
+        .json(&replay)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    let again = server
+        .client
+        .post(server.url("/v1/session"))
+        .json(&replay)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 401, "a challenge is answered once");
+}
+
+#[tokio::test]
+async fn a_revoked_device_is_out_at_once() {
+    let server = start(Registration::Invite).await;
+    let invite = server.invite().await;
+    let first = Device::create_account(&server, &invite, "master", 1).await;
+
+    // A second device, so the first is not the last one standing.
+    let enrolment: serde_json::Value = server
+        .client
+        .post(server.url("/v1/devices/invite"))
+        .bearer_auth(&first.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let second_key = Device::new_key(2);
+    let body: serde_json::Value = server
+        .client
+        .post(server.url("/v1/devices/enrol"))
+        .json(&json!({
+            "enrolment": enrolment["token"],
+            "authKey": login_key("master"),
+            "device": {
+                "name": "LVLaptop",
+                "publicKey": uwussh_server::b64::encode(second_key.verifying_key().to_bytes()),
+            },
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut second = Device {
+        signing: second_key,
+        account: first.account,
+        id: body["deviceId"].as_str().unwrap().parse().unwrap(),
+        token: body["token"].as_str().unwrap().to_string(),
+        vault_id: first.vault_id,
+    };
+    assert_eq!(second.pull(&server, 0).await.envelopes.len(), 0);
+
+    let revoked = server
+        .client
+        .delete(server.url(&format!("/v1/devices/{}", second.id)))
+        .bearer_auth(&first.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), 204);
+
+    // The token it was holding is worthless from this moment.
+    let response = server
+        .client
+        .get(server.url("/v1/records"))
+        .bearer_auth(&second.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+    // And it cannot sign in again either.
+    assert_eq!(second.login(&server).await, 401);
+
+    // The last device standing cannot shut itself out: nobody would be left.
+    let refused = server
+        .client
+        .delete(server.url(&format!("/v1/devices/{}", first.id)))
+        .bearer_auth(&first.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+}
+
+#[tokio::test]
+async fn records_of_one_account_never_reach_another() {
+    let server = start(Registration::Open).await;
+    let mine = Device::create_account(&server, "", "master", 1).await;
+    let theirs = Device::create_account(&server, "", "other", 2).await;
+    theirs
+        .push(&server, &[theirs.envelope(Uuid::now_v7(), 0, b"theirs")])
+        .await;
+
+    assert!(mine.pull(&server, 0).await.envelopes.is_empty());
+
+    // Nor can one account's device push into the other's vault.
+    let mut stranger = mine.envelope(Uuid::now_v7(), 0, b"mine");
+    stranger.vault_id = theirs.vault_id;
+    let response = server
+        .client
+        .post(server.url("/v1/records"))
+        .bearer_auth(&mine.token)
+        .json(&json!({ "schema": SCHEMA_VERSION, "envelopes": [stranger] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+
+    // And the device list is the account's own.
+    let devices: serde_json::Value = server
+        .client
+        .get(server.url("/v1/devices"))
+        .bearer_auth(&mine.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(devices.as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn an_invite_lets_exactly_one_account_in() {
+    let server = start(Registration::Invite).await;
+    let invite = server.invite().await;
+    Device::create_account(&server, &invite, "master", 1).await;
+
+    for code in [invite.as_str(), "MADE-UPCO-DEXX", ""] {
+        let response = server
+            .client
+            .post(server.url("/v1/accounts"))
+            .json(&json!({
+                "invite": code,
+                "vault": Server::vault(Uuid::now_v7()),
+                "authKey": login_key("master"),
+                "device": { "name": "another", "publicKey": uwussh_server::b64::encode([3u8; 32]) },
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401, "with {code:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_closed_server_takes_no_new_accounts() {
+    let server = start(Registration::Closed).await;
+    let response = server
+        .client
+        .post(server.url("/v1/accounts"))
+        .json(&json!({
+            "vault": Server::vault(Uuid::now_v7()),
+            "authKey": login_key("master"),
+            "device": { "name": "x", "publicKey": uwussh_server::b64::encode([4u8; 32]) },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+}
+
+#[tokio::test]
+async fn a_client_from_another_schema_is_turned_away_before_anything_is_stored() {
+    let server = start(Registration::Open).await;
+    let device = Device::create_account(&server, "", "master", 1).await;
+
+    let response = server
+        .client
+        .post(server.url("/v1/records"))
+        .bearer_auth(&device.token)
+        .json(&json!({
+            "schema": SCHEMA_VERSION + 1,
+            "envelopes": [device.envelope(Uuid::now_v7(), 0, b"from the future")],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"], "schema");
+    assert!(device.pull(&server, 0).await.envelopes.is_empty());
+}
+
+#[tokio::test]
+async fn changing_the_master_password_takes_the_old_one() {
+    let server = start(Registration::Open).await;
+    let device = Device::create_account(&server, "", "master", 1).await;
+
+    let change = |current: &'static str, next: &'static str, vault: Uuid| {
+        server
+            .client
+            .put(server.url("/v1/vault/key"))
+            .bearer_auth(&device.token)
+            .json(&json!({
+                "currentAuthKey": login_key(current),
+                "vault": Server::vault(vault),
+                "authKey": login_key(next),
+            }))
+            .send()
+    };
+
+    assert_eq!(
+        change("not the password", "new", device.vault_id)
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        change("master", "new", Uuid::now_v7())
+            .await
+            .unwrap()
+            .status(),
+        400,
+        "and it stays the same vault"
+    );
+    assert_eq!(
+        change("master", "new", device.vault_id)
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+
+    // The new password is the one that counts now — which the next device to
+    // join finds out.
+    let enrolment: serde_json::Value = server
+        .client
+        .post(server.url("/v1/devices/invite"))
+        .bearer_auth(&device.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let join = |password: &'static str| {
+        server
+            .client
+            .post(server.url("/v1/devices/enrol"))
+            .json(&json!({
+                "enrolment": enrolment["token"],
+                "authKey": login_key(password),
+                "device": { "name": "next", "publicKey": uwussh_server::b64::encode([5u8; 32]) },
+            }))
+            .send()
+    };
+    assert_eq!(join("master").await.unwrap().status(), 401);
+    assert_eq!(join("new").await.unwrap().status(), 200);
+}
+
+#[tokio::test]
+async fn a_device_hears_that_there_is_something_new() {
+    let server = start(Registration::Open).await;
+    let listener = Device::create_account(&server, "", "master", 1).await;
+
+    let mut stream = server
+        .client
+        .get(server.url("/v1/events"))
+        .bearer_auth(&listener.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), 200);
+
+    // Wait until the stream is really subscribed, then push.
+    for _ in 0..100 {
+        if server.state.events.listeners(listener.account) > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    listener
+        .push(
+            &server,
+            &[listener.envelope(Uuid::now_v7(), 0, b"new host")],
+        )
+        .await;
+
+    let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), stream.chunk())
+        .await
+        .expect("an event within five seconds")
+        .unwrap()
+        .expect("some bytes");
+    let text = String::from_utf8_lossy(&chunk).to_string();
+    assert!(text.contains("event: records"), "{text}");
+    assert!(text.contains("data: 1"), "{text}");
+}
+
+#[tokio::test]
+async fn the_health_check_says_nothing_about_the_accounts() {
+    let server = start(Registration::Open).await;
+    Device::create_account(&server, "", "master", 1).await;
+
+    let body: serde_json::Value = server
+        .client
+        .get(server.url("/healthz"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["schema"], SCHEMA_VERSION);
+    assert_eq!(body.as_object().unwrap().len(), 2, "{body}");
+}
+
+#[tokio::test]
+async fn guessing_is_slowed_down() {
+    let server = start(Registration::Open).await;
+    let device = Device::create_account(&server, "", "master", 1).await;
+
+    // The session bucket allows thirty tries a minute per address.
+    let mut refused = false;
+    for _ in 0..40 {
+        let response = server
+            .client
+            .post(server.url("/v1/session"))
+            .json(&json!({ "deviceId": device.id, "signature": uwussh_server::b64::encode([0u8; 64]) }))
+            .send()
+            .await
+            .unwrap();
+        if response.status() == 429 {
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused, "a guesser must run into a wall");
+}

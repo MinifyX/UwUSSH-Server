@@ -1,0 +1,20 @@
+# The whole server. One container, one folder.
+services:
+  uwussh:
+    image: ghcr.io/minifyx/uwussh-server:latest
+    # Or build it yourself:
+    # build: .
+    restart: unless-stopped
+    ports:
+      - '8443:8443'
+    volumes:
+      - ./data:/data
+    environment:
+      # How your devices reach this machine. It goes into the setup code, so
+      # set it to what you would type — not to 0.0.0.0.
+      UWUSSH_PUBLIC: nas.lan:8443
+      # open | invite | closed. With `invite`, the first start writes a setup
+      # code to the log: docker compose logs uwussh
+      UWUSSH_REGISTRATION: invite
+      # Only behind a reverse proxy that sets X-Forwarded-For.
+      # UWUSSH_TRUST_FORWARDED: "1"
