@@ -7,9 +7,8 @@
 //! one alone gets nowhere, which is what makes an intercepted pairing code
 //! worthless.
 
-use super::{auth_key, who, Admitted, NewDevice, Peer};
+use super::{auth_key, device_key, who, Admitted, Peer};
 use crate::auth::Authenticated;
-use crate::db::devices::DeviceSummary;
 use crate::db::{accounts, devices, invites};
 use crate::limits;
 use crate::state::AppState;
@@ -17,8 +16,8 @@ use crate::{ApiError, Result};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use uwussh_proto::api::DeviceSummary;
 
 pub async fn list(
     auth: Authenticated,
@@ -28,12 +27,7 @@ pub async fn list(
     Ok(Json(devices::list(&conn, auth.account.id)?))
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Enrolment {
-    pub token: String,
-    pub expires_ms: u64,
-}
+pub use uwussh_proto::api::{EnrolDevice as EnrolRequest, EnrolmentToken as Enrolment};
 
 /// A one-time token for a device about to join, made by a device that is
 /// already in. It travels to the new device through the pairing channel, never
@@ -48,16 +42,6 @@ pub async fn invite(auth: Authenticated, State(state): State<AppState>) -> Resul
     }))
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EnrolRequest {
-    pub enrolment: String,
-    /// Derived from the master password and the account key: proof that this
-    /// is the owner and not whoever got hold of the token.
-    pub auth_key: String,
-    pub device: NewDevice,
-}
-
 pub async fn enrol(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -68,7 +52,7 @@ pub async fn enrol(
     state.limits.check(&who, &limits::ENROL)?;
 
     let key = auth_key(&request.auth_key)?;
-    let device_key = request.device.key()?;
+    let device_key = device_key(&request.device)?;
 
     let conn = state.db.lock();
     // Look first, spend later: a wrong password must not use up the token the

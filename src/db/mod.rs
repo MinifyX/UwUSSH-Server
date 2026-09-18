@@ -61,7 +61,7 @@ impl Db {
     }
 }
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const V1: &str = r#"
 CREATE TABLE accounts (
@@ -141,6 +141,13 @@ CREATE TABLE enrolments (
 );
 "#;
 
+/// Whether a vault needs its account key as well as the password. The server
+/// cannot tell — it never sees either — so the client says, and the server
+/// hands the answer to the next device that joins.
+const V2: &str = r#"
+ALTER TABLE accounts ADD COLUMN needs_account_key INTEGER NOT NULL DEFAULT 0;
+"#;
+
 fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version >= SCHEMA_VERSION {
@@ -152,6 +159,13 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         tx.pragma_update(None, "user_version", 1)?;
         tx.commit()?;
         tracing::info!("database created at schema 1");
+    }
+    if version < 2 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(V2)?;
+        tx.pragma_update(None, "user_version", 2)?;
+        tx.commit()?;
+        tracing::info!("database migrated to schema 2");
     }
     Ok(())
 }

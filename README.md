@@ -87,6 +87,11 @@ into the key derivation — 128 random bits that live only on paired devices and
 in the recovery kit. Whoever takes a copy of this database cannot even start
 guessing the master password against it.
 
+The server never sees that key and could not tell whether one is in use, so the
+client says: a vault header carries `needsAccountKey`, and the server hands
+that on to the next device that joins. Otherwise a device without the kit would
+be told its password was wrong, and would go looking in the wrong place.
+
 ## Configuration
 
 | Variable                 | Default            | What it does                                                      |
@@ -163,14 +168,24 @@ device's address rather than the proxy's.
 ## Building on it
 
 ```bash
-cargo test            # unit tests, and the API over real HTTP
+cargo test            # unit tests, the API over real HTTP, and the real client
 cargo clippy --all-targets -- -D warnings
 ```
 
-`tests/api.rs` drives the real server the way a device does: create an account,
-sign a challenge, push, pull, join a second device, revoke it. The client's own
-`MemoryServer` follows the same rules without a network, so both sides are
-tested against one definition of what this server does.
+`tests/api.rs` drives the server the way a device does, by hand: create an
+account, sign a challenge, push, pull, join a second device, revoke it, pair.
+That proves the server does what it says — but not that the client agrees.
+
+`tests/client.rs` closes that gap. It pulls the actual crates from the client
+repository — its store, its vault, its sync engine, its transport — and runs a
+host with a password in the vault from one device to a second one that joined
+the account, over HTTP, through this server. The two repositories therefore
+cannot drift apart quietly: the shared types come from `uwussh-proto`, and one
+test fails the moment either half stops speaking the same protocol.
+
+It also checks the thing the whole design rests on, from the outside: with the
+records on the server in front of it, none of them contains the hostname, the
+address, the group or the password that went in.
 
 ## Licence
 

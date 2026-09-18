@@ -9,56 +9,21 @@
 use crate::db::constant_time_eq;
 use crate::{now_ms, sha256};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// The vault header as it travels: base64 for the bytes, so it reads as JSON.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct VaultHeader {
-    pub vault_id: Uuid,
-    pub kdf_memory_kib: u32,
-    pub kdf_time_cost: u32,
-    pub kdf_parallelism: u32,
-    pub salt: String,
-    pub wrapped_nonce: String,
-    pub wrapped_blob: String,
-}
+/// The vault header, as the protocol defines it — the same struct the client
+/// serialises, so the two cannot drift into disagreeing about a field name.
+pub use uwussh_proto::api::{WireVault as VaultHeader, WireVaultParams as VaultParams};
 
-/// The part of the header a device may see before it has proved anything: what
-/// it needs to turn a master password into keys, and nothing it could attack
-/// offline.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct VaultParams {
-    pub vault_id: Uuid,
-    pub kdf_memory_kib: u32,
-    pub kdf_time_cost: u32,
-    pub kdf_parallelism: u32,
-    pub salt: String,
-}
-
-impl VaultHeader {
-    pub fn params(&self) -> VaultParams {
-        VaultParams {
-            vault_id: self.vault_id,
-            kdf_memory_kib: self.kdf_memory_kib,
-            kdf_time_cost: self.kdf_time_cost,
-            kdf_parallelism: self.kdf_parallelism,
-            salt: self.salt.clone(),
-        }
-    }
-
-    /// Costs a device can actually run. A header asking for a terabyte of
-    /// memory would lock every device out of its own vault, so it is refused
-    /// on the way in rather than discovered on the way out.
-    pub fn plausible(&self) -> bool {
-        (1..=1024 * 1024).contains(&self.kdf_memory_kib)
-            && (1..=16).contains(&self.kdf_time_cost)
-            && (1..=16).contains(&self.kdf_parallelism)
-            && !self.salt.is_empty()
-            && !self.wrapped_blob.is_empty()
-    }
+/// Costs a device can actually run. A header asking for a terabyte of memory
+/// would lock every device out of its own vault, so it is refused on the way
+/// in rather than discovered on the way out.
+pub fn plausible(header: &VaultHeader) -> bool {
+    (1..=1024 * 1024).contains(&header.kdf_memory_kib)
+        && (1..=16).contains(&header.kdf_time_cost)
+        && (1..=16).contains(&header.kdf_parallelism)
+        && !header.salt.is_empty()
+        && !header.wrapped_blob.is_empty()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,8 +47,8 @@ pub fn create(
     conn.execute(
         "INSERT INTO accounts
             (id, created_ms, vault_id, kdf_memory_kib, kdf_time_cost, kdf_parallelism,
-             salt, wrapped_nonce, wrapped_blob, auth_verifier, seq)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)",
+             salt, wrapped_nonce, wrapped_blob, auth_verifier, seq, needs_account_key)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11)",
         params![
             id.to_string(),
             now_ms() as i64,
@@ -95,6 +60,7 @@ pub fn create(
             header.wrapped_nonce,
             header.wrapped_blob,
             sha256(auth_key).to_vec(),
+            header.needs_account_key,
         ],
     )?;
     Ok(Account {
@@ -129,7 +95,7 @@ pub fn get(conn: &Connection, id: Uuid) -> rusqlite::Result<Option<Account>> {
 pub fn header(conn: &Connection, id: Uuid) -> rusqlite::Result<Option<VaultHeader>> {
     conn.query_row(
         "SELECT vault_id, kdf_memory_kib, kdf_time_cost, kdf_parallelism,
-                salt, wrapped_nonce, wrapped_blob
+                salt, wrapped_nonce, wrapped_blob, needs_account_key
            FROM accounts WHERE id = ?1",
         [id.to_string()],
         |row| {
@@ -142,6 +108,8 @@ pub fn header(conn: &Connection, id: Uuid) -> rusqlite::Result<Option<VaultHeade
                 salt: row.get(4)?,
                 wrapped_nonce: row.get(5)?,
                 wrapped_blob: row.get(6)?,
+                needs_account_key: row.get(7)?,
+                extra: Default::default(),
             })
         },
     )
@@ -176,7 +144,8 @@ pub fn set_header(
     conn.execute(
         "UPDATE accounts
             SET kdf_memory_kib = ?2, kdf_time_cost = ?3, kdf_parallelism = ?4,
-                salt = ?5, wrapped_nonce = ?6, wrapped_blob = ?7, auth_verifier = ?8
+                salt = ?5, wrapped_nonce = ?6, wrapped_blob = ?7, auth_verifier = ?8,
+                needs_account_key = ?9
           WHERE id = ?1",
         params![
             id.to_string(),
@@ -187,6 +156,7 @@ pub fn set_header(
             header.wrapped_nonce,
             header.wrapped_blob,
             sha256(auth_key).to_vec(),
+            header.needs_account_key,
         ],
     )?;
     Ok(())
@@ -206,6 +176,8 @@ pub(crate) mod tests {
             salt: "c2FsdHktc2FsdA".into(),
             wrapped_nonce: "bm9uY2U".into(),
             wrapped_blob: "d3JhcHBlZA".into(),
+            needs_account_key: true,
+            extra: Default::default(),
         }
     }
 
@@ -271,8 +243,22 @@ pub(crate) mod tests {
     fn a_header_asking_for_absurd_costs_is_not_plausible() {
         let mut greedy = header();
         greedy.kdf_memory_kib = u32::MAX;
-        assert!(!greedy.plausible());
-        assert!(header().plausible());
+        assert!(!plausible(&greedy));
+        assert!(plausible(&header()));
+    }
+
+    #[test]
+    fn whether_a_vault_needs_its_account_key_is_remembered() {
+        let db = Db::open_in_memory().unwrap();
+        let conn = db.lock();
+        let account = create(&conn, &header(), b"key").unwrap();
+        assert!(
+            super::header(&conn, account.id)
+                .unwrap()
+                .unwrap()
+                .needs_account_key,
+            "a joining device has to be told, or it blames the password"
+        );
     }
 
     #[test]

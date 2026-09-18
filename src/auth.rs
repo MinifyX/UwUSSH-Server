@@ -26,17 +26,10 @@ use uuid::Uuid;
 /// enough that a copied one is worthless by the time it is copied.
 pub const CHALLENGE_TTL_MS: u64 = 60_000;
 
-/// What a device signs. The label keeps this signature from being useful
-/// anywhere else, and the ids tie it to one device of one account — a
-/// signature made for one server cannot be replayed at another account.
-pub fn signing_material(account: Uuid, device: Uuid, challenge: &[u8]) -> Vec<u8> {
-    let mut material = Vec::with_capacity(16 + 16 + 16 + challenge.len());
-    material.extend_from_slice(b"uwussh/session/v1");
-    material.extend_from_slice(account.as_bytes());
-    material.extend_from_slice(device.as_bytes());
-    material.extend_from_slice(challenge);
-    material
-}
+/// What a device signs — from the protocol crate, because a client that
+/// builds these bytes slightly differently is a client that cannot log in,
+/// and the two would be debugged separately for an afternoon.
+pub use uwussh_proto::api::session_material;
 
 pub fn verify_signature(public_key: &[u8; 32], material: &[u8], signature: &[u8]) -> bool {
     let Ok(key) = VerifyingKey::from_bytes(public_key) else {
@@ -184,14 +177,14 @@ mod tests {
         let device = Uuid::now_v7();
         let challenge = random_bytes::<32>();
 
-        let material = signing_material(account, device, &challenge);
+        let material = session_material(account, device, &challenge);
         let signature = signing.sign(&material).to_bytes();
         assert!(verify_signature(&public, &material, &signature));
 
         for other in [
-            signing_material(Uuid::now_v7(), device, &challenge),
-            signing_material(account, Uuid::now_v7(), &challenge),
-            signing_material(account, device, &random_bytes::<32>()),
+            session_material(Uuid::now_v7(), device, &challenge),
+            session_material(account, Uuid::now_v7(), &challenge),
+            session_material(account, device, &random_bytes::<32>()),
         ] {
             assert!(
                 !verify_signature(&public, &other, &signature),

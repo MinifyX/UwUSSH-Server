@@ -5,7 +5,7 @@
 //! memory for an hour.
 
 use super::{who, Peer};
-use crate::auth::{signing_material, verify_signature};
+use crate::auth::{session_material, verify_signature};
 use crate::db::devices;
 use crate::limits;
 use crate::state::AppState;
@@ -13,20 +13,8 @@ use crate::{b64, random_bytes, ApiError, Result};
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::Json;
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ChallengeRequest {
-    pub device_id: Uuid,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ChallengeResponse {
-    pub challenge: String,
-}
+pub use uwussh_proto::api::{ChallengeRequest, ChallengeResponse, LoginRequest, LoginResponse};
 
 /// Something to sign.
 ///
@@ -56,22 +44,6 @@ pub async fn challenge(
     }))
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LoginRequest {
-    pub device_id: Uuid,
-    /// The challenge, signed with the device's key.
-    pub signature: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LoginResponse {
-    pub account_id: Uuid,
-    pub token: String,
-    pub expires_ms: u64,
-}
-
 pub async fn login(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -97,7 +69,7 @@ pub async fn login(
         .filter(|device| !device.revoked)
         .ok_or(ApiError::Unauthorized)?;
 
-    let material = signing_material(device.account_id, device.id, &challenge);
+    let material = session_material(device.account_id, device.id, &challenge);
     if !verify_signature(&device.public_key, &material, &signature) {
         tracing::warn!(device = %device.id, "a signature that did not check out");
         return Err(ApiError::Unauthorized);

@@ -24,6 +24,11 @@ struct Server {
 }
 
 async fn start(registration: Registration) -> Server {
+    // The client crate brings in a rustls that expects its provider to be
+    // chosen, and cargo unifies features across the test binary. Choosing it
+    // here is what the server itself does when it serves.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let config = Config {
         registration,
         ..Config::default()
@@ -142,7 +147,7 @@ impl Device {
             .unwrap();
         let challenge =
             uwussh_server::b64::decode(challenge["challenge"].as_str().unwrap()).unwrap();
-        let material = uwussh_server::auth::signing_material(self.account, self.id, &challenge);
+        let material = uwussh_server::auth::session_material(self.account, self.id, &challenge);
         let signature = self.signing.sign(&material).to_bytes();
 
         let response = server
@@ -403,7 +408,7 @@ async fn nothing_reaches_anyone_who_did_not_sign() {
         .await
         .unwrap();
     let raw = uwussh_server::b64::decode(challenge["challenge"].as_str().unwrap()).unwrap();
-    let material = uwussh_server::auth::signing_material(device.account, device.id, &raw);
+    let material = uwussh_server::auth::session_material(device.account, device.id, &raw);
     let signature = uwussh_server::b64::encode(device.signing.sign(&material).to_bytes());
     let replay = json!({ "deviceId": device.id, "signature": signature });
 

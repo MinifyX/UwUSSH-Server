@@ -14,17 +14,12 @@ use crate::{b64, ApiError, Result};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::time::Duration;
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Opened {
-    /// The short id that names this session. The words a user reads out are
-    /// the client's, and never come here.
-    pub id: String,
-    pub expires_ms: u64,
-}
+pub use uwussh_proto::api::{
+    PairMessage as PostMessage, PairMessages as Messages, PairOpened as Opened,
+};
 
 /// A device that is already in opens the session.
 pub async fn open(auth: Authenticated, State(state): State<AppState>) -> Result<Json<Opened>> {
@@ -34,14 +29,6 @@ pub async fn open(auth: Authenticated, State(state): State<AppState>) -> Result<
         id,
         expires_ms: crate::now_ms() + pairing::TTL_MS,
     }))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PostMessage {
-    /// `a` for the device that opened the session, `b` for the one joining.
-    pub side: String,
-    pub message: String,
 }
 
 /// Leave a message for the other side. Not authenticated: the device that is
@@ -74,14 +61,6 @@ pub struct ReadQuery {
     /// Wait for something to arrive rather than answering empty at once.
     #[serde(default)]
     pub wait: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Messages {
-    pub messages: Vec<String>,
-    /// What to pass as `after` next time.
-    pub next: usize,
 }
 
 /// What the other side has said. With `wait=true` this holds the request open

@@ -7,7 +7,6 @@
 
 use crate::now_ms;
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,16 +19,9 @@ pub struct Device {
     pub revoked: bool,
 }
 
-/// What the device list shows. No key material: the list is for people.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeviceSummary {
-    pub id: Uuid,
-    pub name: String,
-    pub created_ms: u64,
-    pub last_seen_ms: Option<u64>,
-    pub revoked_ms: Option<u64>,
-}
+/// What the device list shows. No key material: the list is for people — and
+/// the shape comes from the protocol crate, like everything else on the wire.
+pub use uwussh_proto::api::DeviceSummary;
 
 /// A name for the device list: one line, not a novel, and nothing that could
 /// pass for markup in a log or a list.

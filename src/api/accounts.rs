@@ -6,10 +6,10 @@
 //! it knows the password, and the parameters alone are handed to a device that
 //! is in the middle of joining. Those are two different endpoints on purpose.
 
-use super::{auth_key, who, Admitted, NewDevice, Peer};
+use super::{auth_key, device_key, who, Admitted, Peer};
 use crate::auth::Authenticated;
 use crate::config::Registration;
-use crate::db::accounts::{VaultHeader, VaultParams};
+use crate::db::accounts::{plausible, VaultHeader, VaultParams};
 use crate::db::{accounts, devices, invites};
 use crate::limits;
 use crate::state::AppState;
@@ -19,17 +19,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateAccount {
-    #[serde(default)]
-    pub invite: String,
-    pub vault: VaultHeader,
-    /// Derived from the master password and the account key. The server keeps
-    /// only its hash.
-    pub auth_key: String,
-    pub device: NewDevice,
-}
+pub use uwussh_proto::api::CreateAccount;
 
 /// The first device of a new account.
 pub async fn create(
@@ -41,13 +31,13 @@ pub async fn create(
     let who = who(&state, &headers, peer);
     state.limits.check(&who, &limits::ACCOUNTS)?;
 
-    if !request.vault.plausible() {
+    if !plausible(&request.vault) {
         return Err(ApiError::Invalid(
             "a vault header no device could open".into(),
         ));
     }
     let key = auth_key(&request.auth_key)?;
-    let device_key = request.device.key()?;
+    let device_key = device_key(&request.device)?;
 
     let conn = state.db.lock();
     match state.config.registration {
@@ -116,16 +106,7 @@ pub async fn vault_params(
     Ok(Json(header.params()))
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ChangePassword {
-    /// Proof that whoever asks knows the password being replaced. The device's
-    /// own token is not enough: a stolen one must not be able to lock everyone
-    /// else out.
-    pub current_auth_key: String,
-    pub vault: VaultHeader,
-    pub auth_key: String,
-}
+pub use uwussh_proto::api::ChangePassword;
 
 /// A new master password: the vault key is wrapped again, the verifier
 /// replaced, and not one record is touched.
@@ -136,7 +117,7 @@ pub async fn change_password(
 ) -> Result<StatusCode> {
     let current = auth_key(&request.current_auth_key)?;
     let next = auth_key(&request.auth_key)?;
-    if !request.vault.plausible() {
+    if !plausible(&request.vault) {
         return Err(ApiError::Invalid(
             "a vault header no device could open".into(),
         ));

@@ -13,7 +13,7 @@ use axum::http::request::Parts;
 use axum::http::HeaderMap;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::net::SocketAddr;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
@@ -65,32 +65,15 @@ async fn health() -> Json<Health> {
     })
 }
 
-/// A device as it enrols: what to call it, and the key it will sign with.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NewDevice {
-    #[serde(default)]
-    pub name: String,
-    /// Ed25519, 32 bytes, base64.
-    pub public_key: String,
-}
+/// A device as it enrols, and what it gets when it is let in — both from the
+/// protocol crate, so the client cannot spell a field differently.
+pub use uwussh_proto::api::{Admitted, NewDevice};
 
-impl NewDevice {
-    pub fn key(&self) -> Result<[u8; 32]> {
-        b64::decode(&self.public_key)
-            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-            .ok_or_else(|| ApiError::Invalid("a device key must be 32 bytes".into()))
-    }
-}
-
-/// What a device gets when it is let in.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Admitted {
-    pub account_id: uuid::Uuid,
-    pub device_id: uuid::Uuid,
-    pub token: String,
-    pub expires_ms: u64,
+/// The device key out of what arrived, or a refusal.
+pub fn device_key(device: &NewDevice) -> Result<[u8; 32]> {
+    b64::decode(&device.public_key)
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .ok_or_else(|| ApiError::Invalid("a device key must be 32 bytes".into()))
 }
 
 /// The key a device proves the master password with, decoded.
