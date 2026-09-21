@@ -75,8 +75,18 @@ pub struct Config {
     pub channel: Option<String>,
     /// How many accounts this server takes, whoever asks.
     pub max_accounts: u64,
-    /// What one account may hold.
+    /// What one account may hold, and what all of them together may.
     pub quota: crate::db::records::Quota,
+    /// Connections open at once, from everybody.
+    pub max_connections: usize,
+    /// Connections open at once from one address (an IPv6 /64 counts as one).
+    /// Zero for no limit. Not applied behind a proxy, where every connection
+    /// comes from the proxy.
+    pub max_connections_per_address: usize,
+    /// The cheapest key derivation a vault header may ask for. Not read from
+    /// the environment: a floor an operator can lower is one a mistake lowers
+    /// too. Tests lower it, because they derive keys by the dozen.
+    pub kdf_floor: crate::db::accounts::KdfFloor,
 }
 
 impl Default for Config {
@@ -93,6 +103,9 @@ impl Default for Config {
             channel: None,
             max_accounts: 100,
             quota: crate::db::records::Quota::default(),
+            max_connections: 512,
+            max_connections_per_address: 32,
+            kdf_floor: crate::db::accounts::KdfFloor::default(),
         }
     }
 }
@@ -146,6 +159,21 @@ impl Config {
             config.quota.bytes = number("UWUSSH_ACCOUNT_MAX_MB", &megabytes)?
                 .checked_mul(1024 * 1024)
                 .ok_or("UWUSSH_ACCOUNT_MAX_MB is more than any disk")?;
+        }
+        if let Some(megabytes) = var("UWUSSH_SERVER_MAX_MB") {
+            config.quota.server_bytes = number("UWUSSH_SERVER_MAX_MB", &megabytes)?
+                .checked_mul(1024 * 1024)
+                .ok_or("UWUSSH_SERVER_MAX_MB is more than any disk")?;
+        }
+        if let Some(max) = var("UWUSSH_MAX_CONNECTIONS") {
+            config.max_connections = number("UWUSSH_MAX_CONNECTIONS", &max)? as usize;
+            if config.max_connections == 0 {
+                return Err("UWUSSH_MAX_CONNECTIONS of 0 would let nobody in".into());
+            }
+        }
+        if let Some(max) = var("UWUSSH_MAX_CONNECTIONS_PER_IP") {
+            config.max_connections_per_address =
+                number("UWUSSH_MAX_CONNECTIONS_PER_IP", &max)? as usize;
         }
         Ok(config)
     }
@@ -205,6 +233,11 @@ mod tests {
         assert!(!config.trust_forwarded, "off unless a proxy is in front");
         assert!(config.update_check);
         assert_eq!(config.database().file_name().unwrap(), "uwussh.db");
+        assert_eq!(config.quota.server_bytes, 2048 * 1024 * 1024);
+        assert_eq!(config.max_connections, 512);
+        assert_eq!(config.max_connections_per_address, 32);
+        assert_eq!(config.kdf_floor.memory_kib, 19456);
+        assert_eq!(config.kdf_floor.time_cost, 2);
     }
 
     #[test]

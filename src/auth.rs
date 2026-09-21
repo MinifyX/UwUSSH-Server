@@ -18,7 +18,7 @@ use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use ed25519_dalek::{Signature, VerifyingKey};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -117,19 +117,53 @@ pub struct Session {
     pub expires_ms: u64,
 }
 
+/// Tokens one device may hold at once. A device uses one at a time; a few
+/// more cover an app that signed in again before the old token ran out. Past
+/// that the oldest goes — a device signing in in a loop, which each success
+/// lets it do, must not grow this table without end.
+pub const TOKENS_PER_DEVICE: usize = 8;
+
+/// Every token, and each device's own, oldest first.
+#[derive(Default)]
+struct Tokens {
+    by_token: HashMap<String, Session>,
+    by_device: HashMap<Uuid, VecDeque<String>>,
+}
+
 /// Session tokens, in memory only.
 #[derive(Clone, Default)]
 pub struct Sessions {
-    inner: Arc<Mutex<HashMap<String, Session>>>,
+    inner: Arc<Mutex<Tokens>>,
 }
 
 impl Sessions {
     pub fn issue(&self, account_id: Uuid, device_id: Uuid, ttl_ms: u64) -> (String, u64) {
         let token = b64::encode(random_bytes::<32>());
-        let expires_ms = now_ms() + ttl_ms;
+        let now = now_ms();
+        let expires_ms = now + ttl_ms;
         let mut inner = self.inner.lock();
-        inner.retain(|_, session| session.expires_ms > now_ms());
-        inner.insert(
+        let Tokens {
+            by_token,
+            by_device,
+        } = &mut *inner;
+        // This device's own expired ones go now, and its oldest when it has
+        // too many. Everybody else's wait for the sweep: going through every
+        // token on every sign-in is work a busy server should not do.
+        let held = by_device.entry(device_id).or_default();
+        held.retain(|token| match by_token.get(token) {
+            Some(session) if session.expires_ms > now => true,
+            _ => {
+                by_token.remove(token);
+                false
+            }
+        });
+        while held.len() >= TOKENS_PER_DEVICE {
+            if let Some(oldest) = held.pop_front() {
+                by_token.remove(&oldest);
+            }
+        }
+        held.push_back(token.clone());
+        by_token.insert(
             token.clone(),
             Session {
                 account_id,
@@ -141,19 +175,40 @@ impl Sessions {
     }
 
     pub fn get(&self, token: &str) -> Option<Session> {
-        let session = *self.inner.lock().get(token)?;
+        let session = *self.inner.lock().by_token.get(token)?;
         (session.expires_ms > now_ms()).then_some(session)
     }
 
     /// Revoking a device must not leave it an hour of access it already holds.
     pub fn drop_device(&self, device_id: Uuid) {
-        self.inner
-            .lock()
-            .retain(|_, session| session.device_id != device_id);
+        let mut inner = self.inner.lock();
+        if let Some(held) = inner.by_device.remove(&device_id) {
+            for token in held {
+                inner.by_token.remove(&token);
+            }
+        }
+    }
+
+    /// Forget every token that has run out. Called now and then by the
+    /// server's own timer; returns how many went.
+    pub fn sweep(&self) -> usize {
+        let now = now_ms();
+        let mut inner = self.inner.lock();
+        let Tokens {
+            by_token,
+            by_device,
+        } = &mut *inner;
+        let before = by_token.len();
+        by_token.retain(|_, session| session.expires_ms > now);
+        by_device.retain(|_, held| {
+            held.retain(|token| by_token.contains_key(token));
+            !held.is_empty()
+        });
+        before - by_token.len()
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().len()
+        self.inner.lock().by_token.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -292,6 +347,49 @@ mod tests {
 
         let (expired, _) = sessions.issue(account, device, 0);
         assert!(sessions.get(&expired).is_none());
+    }
+
+    #[test]
+    fn a_device_holds_only_a_few_tokens_and_loses_the_oldest() {
+        let sessions = Sessions::default();
+        let account = Uuid::now_v7();
+        let device = Uuid::now_v7();
+        let (other, _) = sessions.issue(account, Uuid::now_v7(), 60_000);
+        let tokens: Vec<String> = (0..TOKENS_PER_DEVICE + 3)
+            .map(|_| sessions.issue(account, device, 60_000).0)
+            .collect();
+
+        for old in &tokens[..3] {
+            assert!(sessions.get(old).is_none(), "the oldest went");
+        }
+        for newer in &tokens[3..] {
+            assert!(sessions.get(newer).is_some());
+        }
+        assert!(
+            sessions.get(&other).is_some(),
+            "another device keeps its own"
+        );
+        assert_eq!(sessions.len(), TOKENS_PER_DEVICE + 1);
+    }
+
+    #[test]
+    fn a_sweep_forgets_what_ran_out_and_nothing_else() {
+        let sessions = Sessions::default();
+        let account = Uuid::now_v7();
+        let (live, _) = sessions.issue(account, Uuid::now_v7(), 60_000);
+        for _ in 0..5 {
+            sessions.issue(account, Uuid::now_v7(), 0);
+        }
+        assert_eq!(sessions.len(), 6, "an expired token stays until the sweep");
+
+        assert_eq!(sessions.sweep(), 5);
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions.get(&live).is_some());
+        assert_eq!(
+            sessions.inner.lock().by_device.len(),
+            1,
+            "and devices with nothing left are gone too"
+        );
     }
 
     #[test]

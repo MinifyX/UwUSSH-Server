@@ -21,6 +21,12 @@ pub struct PullQuery {
     #[serde(default)]
     pub since: u64,
     pub limit: Option<usize>,
+    /// Set by clients that know manifests. One from before them fails to
+    /// read a whole page with a record kind it has never heard of, so it
+    /// gets none.
+    /// Clients send `manifests=1`.
+    #[serde(default)]
+    pub manifests: u8,
 }
 
 /// Everything after a cursor. The device's own records come back too — it
@@ -34,7 +40,13 @@ pub async fn pull(
     state.limits.check_account(auth.account.id, &limits::PULL)?;
     let limit = query.limit.unwrap_or(MAX_BATCH).min(MAX_BATCH);
     let conn = state.db.lock();
-    let page = records::pull(&conn, &auth.account, query.since, limit)?;
+    let page = records::pull(
+        &conn,
+        &auth.account,
+        query.since,
+        limit,
+        query.manifests != 0,
+    )?;
     // How far this device has read decides what the server may forget — so
     // never further than there is: a device with a cursor from another server,
     // or from before a restore, must not let tombstones go it never saw.

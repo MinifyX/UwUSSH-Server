@@ -37,6 +37,11 @@ pub async fn create(
             "a vault header no device could open".into(),
         ));
     }
+    state
+        .config
+        .kdf_floor
+        .check(&request.vault)
+        .map_err(ApiError::Invalid)?;
     let key = auth_key(&request.auth_key)?;
     let device_key = device_key(&request.device)?;
 
@@ -125,6 +130,11 @@ pub async fn change_password(
             "a vault header no device could open".into(),
         ));
     }
+    state
+        .config
+        .kdf_floor
+        .check(&request.vault)
+        .map_err(ApiError::Invalid)?;
     if request.vault.vault_id != auth.account.vault_id {
         // Changing the password does not change which vault this is. A header
         // for another vault would orphan every record in the account.

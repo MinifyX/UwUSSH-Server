@@ -7,14 +7,13 @@
 use axum_server::tls_rustls::RustlsConfig;
 use axum_server::Handle;
 use clap::{Parser, Subcommand};
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use uuid::Uuid;
 use uwussh_server::api;
 use uwussh_server::config::TlsMode;
 use uwussh_server::db::{accounts, devices, invites, records, Db};
-use uwussh_server::{health, now_ms, tls, updates, AppState, Config};
+use uwussh_server::{connections, health, now_ms, tls, updates, AppState, Config};
 
 #[derive(Parser)]
 #[command(name = "uwussh-server", version, about = "Sync server for UwUSSH")]
@@ -208,6 +207,7 @@ fn main() -> Result<(), String> {
         }
         Command::Backup { to } => {
             let path = to.unwrap_or_else(|| backup_path(&config));
+            room_for_backup(&config, &path)?;
             db.backup_to(&path).map_err(|error| error.to_string())?;
             println!("Written to {}", path.display());
             Ok(())
@@ -254,64 +254,61 @@ async fn serve(db: Db, config: Config) -> Result<(), String> {
 
     let listen = config.listen;
     let url = config.base_url();
+    let limits = connections::Limits::from_config(&config);
     let state = AppState::new(db, config);
     maintenance(state.clone());
     updates::spawn(state.config.clone());
     tracing::info!(version = updates::build().version, "UwUSSH Server");
-    let app = api::router(state).into_make_service_with_connect_info::<SocketAddr>();
 
-    match identity {
-        Some(identity) => {
-            let tls = RustlsConfig::from_pem(
-                identity.cert_pem.into_bytes(),
-                identity.key_pem.into_bytes(),
+    // Every connection is an open file, and the server takes hundreds.
+    match connections::raise_open_files() {
+        Some(files) if files < limits.max as u64 + 64 => tracing::warn!(
+            files,
+            connections = limits.max,
+            "this process may open fewer files than the server takes connections; \
+             raise the limit (ulimit -n) or lower UWUSSH_MAX_CONNECTIONS"
+        ),
+        _ => {}
+    }
+
+    let tls = match &identity {
+        Some(identity) => Some(
+            RustlsConfig::from_pem(
+                identity.cert_pem.clone().into_bytes(),
+                identity.key_pem.clone().into_bytes(),
             )
             .await
-            .map_err(|error| format!("certificate: {error}"))?;
+            .map_err(|error| format!("certificate: {error}"))?,
+        ),
+        None => None,
+    };
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .and_then(|listener| listener.into_std())
+        .map_err(|error| format!("cannot listen on {listen}: {error}"))?;
 
-            let handle = Handle::new();
-            tokio::spawn({
-                let handle = handle.clone();
-                async move {
-                    shutdown().await;
-                    handle.graceful_shutdown(Some(GRACE));
-                }
-            });
-            tracing::info!(%listen, %url, fingerprint = %identity.fingerprint, "UwUSSH sync server ready");
-            axum_server::bind_rustls(listen, tls)
-                .handle(handle)
-                .serve(app)
-                .await
-                .map_err(|error| error.to_string())
+    // An event stream never ends by itself, and a graceful shutdown waits for
+    // every connection — so after the grace period it stops waiting.
+    let handle = Handle::new();
+    tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            shutdown().await;
+            handle.graceful_shutdown(Some(GRACE));
         }
-        None => {
-            let listener = tokio::net::TcpListener::bind(listen)
-                .await
-                .map_err(|error| format!("cannot listen on {listen}: {error}"))?;
-            tracing::warn!(
-                %listen, %url,
-                "serving plain HTTP — put a reverse proxy with a certificate in front"
-            );
-            // An event stream never ends by itself, and a graceful shutdown
-            // waits for every connection — so after the grace period it stops
-            // waiting, as the TLS side does.
-            let stopping = std::sync::Arc::new(tokio::sync::Notify::new());
-            let serving = axum::serve(listener, app).with_graceful_shutdown({
-                let stopping = stopping.clone();
-                async move {
-                    shutdown().await;
-                    stopping.notify_one();
-                }
-            });
-            tokio::select! {
-                served = serving => served.map_err(|error| error.to_string()),
-                _ = async {
-                    stopping.notified().await;
-                    tokio::time::sleep(GRACE).await;
-                } => Ok(()),
-            }
+    });
+    match &identity {
+        Some(identity) => {
+            tracing::info!(%listen, %url, fingerprint = %identity.fingerprint, "UwUSSH sync server ready")
         }
+        None => tracing::warn!(
+            %listen, %url,
+            "serving plain HTTP — put a reverse proxy with a certificate in front"
+        ),
     }
+    connections::serve(listener, api::router(state), tls, limits, handle)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// How long open connections get to finish once the server is told to stop.
@@ -342,8 +339,24 @@ async fn shutdown() {
     tracing::info!("stopping");
 }
 
-/// Once a day: a backup, and a sweep of what nobody needs any more.
+/// Backups kept: a week of nights, the ones before updates counted in. Each
+/// is a whole copy of the database, so this number times the database is
+/// what they take on disk.
+const BACKUPS_KEPT: usize = 7;
+
+/// Once a day: a backup, and a sweep of what nobody needs any more. And every
+/// few minutes, the session tokens that ran out.
 fn maintenance(state: AppState) {
+    tokio::spawn({
+        let sessions = state.sessions.clone();
+        async move {
+            let mut every = tokio::time::interval(Duration::from_secs(5 * 60));
+            loop {
+                every.tick().await;
+                sessions.sweep();
+            }
+        }
+    });
     tokio::spawn(async move {
         let day = Duration::from_secs(24 * 60 * 60);
         // Not at once on start: a server that is restarted in a loop should
@@ -354,10 +367,12 @@ fn maintenance(state: AppState) {
             let config = state.config.clone();
             let done = tokio::task::spawn_blocking(move || {
                 let path = backup_path(&config);
-                if let Err(error) = db.backup_to(&path) {
+                if let Err(error) = room_for_backup(&config, &path) {
+                    tracing::warn!("no backup tonight: {error}");
+                } else if let Err(error) = db.backup_to(&path) {
                     tracing::warn!(%error, "backup failed");
                 } else {
-                    keep_newest(&config.backups(), 14);
+                    keep_newest(&config.backups(), BACKUPS_KEPT);
                 }
                 purge(&db);
             })
@@ -405,6 +420,63 @@ fn purge(db: &Db) {
             Err(error) => tracing::warn!(%error, "could not purge tombstones"),
         }
     }
+}
+
+/// Whether a backup to `path` leaves the disk with room to spare. A backup
+/// is about as large as the database, and one that fills the disk takes the
+/// database down with it: the next write has nowhere to go. So it is only
+/// written when what is free afterwards is still a twentieth of the disk, and
+/// at least 256 MiB.
+fn room_for_backup(config: &Config, path: &std::path::Path) -> Result<(), String> {
+    let database = config.database();
+    let size = |path: &std::path::Path| std::fs::metadata(path).map_or(0, |meta| meta.len());
+    let need = size(&database) + size(&database.with_file_name("uwussh.db-wal"));
+    // The directory it goes into may not be there yet; the disk it will be
+    // on is that of the nearest one that is.
+    let Some((free, total)) = path.ancestors().skip(1).find_map(disk_space) else {
+        return Ok(());
+    };
+    enough_room(free, total, need).then_some(()).ok_or_else(|| {
+        format!(
+            "{} MiB free, and a backup of about {} MiB would leave less than the disk needs \
+             to keep going. Make room, or copy the backups under backups/ elsewhere and \
+             remove old ones",
+            free / (1024 * 1024),
+            need.div_ceil(1024 * 1024)
+        )
+    })
+}
+
+/// Whether `need` bytes fit into `free` with a margin left over.
+fn enough_room(free: u64, total: u64, need: u64) -> bool {
+    let margin = (total / 20).max(256 * 1024 * 1024);
+    free >= need.saturating_add(margin)
+}
+
+/// Free and total bytes of the file system `path` is on, for whoever may
+/// write there — or nothing, where that is not known.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
+fn disk_space(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs reads a NUL-terminated path and writes one struct,
+    // both of which live on this stack for the length of the call; the
+    // struct is plain data, for which all zeroes is a valid value.
+    let stat = unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(path.as_ptr(), &mut stat) != 0 {
+            return None;
+        }
+        stat
+    };
+    let unit = stat.f_frsize as u64;
+    Some((stat.f_bavail as u64 * unit, stat.f_blocks as u64 * unit))
+}
+
+#[cfg(not(unix))]
+fn disk_space(_path: &std::path::Path) -> Option<(u64, u64)> {
+    None
 }
 
 /// Keep the newest `keep` backups and remove the rest.
@@ -589,6 +661,22 @@ mod tests {
     fn a_setup_code_falls_back_to_where_the_server_listens() {
         let parsed = decode(&setup_code(&Config::default(), "X", None));
         assert_eq!(parsed["u"], "https://0.0.0.0:8443");
+    }
+
+    #[test]
+    fn a_backup_is_written_only_with_room_to_spare() {
+        const MIB: u64 = 1024 * 1024;
+        // A 32 GiB disk: the margin is a twentieth of it.
+        let disk = 32 * 1024 * MIB;
+        assert!(enough_room(10 * 1024 * MIB, disk, 100 * MIB));
+        assert!(
+            !enough_room(1700 * MIB, disk, 100 * MIB),
+            "under the margin after"
+        );
+        // A small disk still keeps 256 MiB.
+        assert!(!enough_room(300 * MIB, 1024 * MIB, 50 * MIB));
+        assert!(enough_room(400 * MIB, 1024 * MIB, 50 * MIB));
+        assert!(!enough_room(disk, disk, u64::MAX), "no overflow");
     }
 
     #[test]

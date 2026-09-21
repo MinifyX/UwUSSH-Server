@@ -156,7 +156,7 @@ pub fn client_key(
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn counted(address: IpAddr) -> String {
+pub(crate) fn counted(address: IpAddr) -> String {
     match address {
         IpAddr::V4(v4) => v4.to_string(),
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {

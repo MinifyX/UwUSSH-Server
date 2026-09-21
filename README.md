@@ -129,6 +129,9 @@ be told its password was wrong, and would go looking in the wrong place.
 | `UWUSSH_MAX_ACCOUNTS`    | `100`              | How many accounts the server takes, whoever asks                  |
 | `UWUSSH_ACCOUNT_MAX_RECORDS` | `100000`       | What one account may hold, in records…                            |
 | `UWUSSH_ACCOUNT_MAX_MB`  | `256`              | …and in megabytes                                                 |
+| `UWUSSH_SERVER_MAX_MB`   | `2048`             | What all accounts together may hold, in megabytes                 |
+| `UWUSSH_MAX_CONNECTIONS` | `512`              | Connections open at once, from everybody                          |
+| `UWUSSH_MAX_CONNECTIONS_PER_IP` | `32`       | …and from one address (an IPv6 /64); `0` for no limit. Not applied behind a proxy |
 
 With Docker these come from `.env` next to `compose.yaml`, which install.sh
 writes; `UWUSSH_BIND` there says where the container is published and
@@ -152,11 +155,20 @@ uwussh-server new-key          a new certificate key, when the old one is lost f
 In Docker: `docker compose exec uwussh uwussh-server <command>`, from
 `/opt/uwussh`.
 
-Backups run by themselves too: one a night, fourteen kept, and one more before
-every update — written with `VACUUM INTO`, because copying a live SQLite file
-gives you the database without its write-ahead log, which is a backup that
-looks fine until you need it. `restore` checks a backup before it trusts it,
-refuses while the server runs, and keeps the database it replaces.
+Backups run by themselves too: one a night, and one more before every update,
+seven kept in all — written with `VACUUM INTO`, because copying a live SQLite
+file gives you the database without its write-ahead log, which is a backup that
+looks fine until you need it. A backup that would leave the disk with less than
+a twentieth free (and at least 256 MiB) is skipped with a warning instead.
+`restore` checks a backup before it trusts it, refuses while the server runs,
+and keeps the database it replaces.
+
+**How much disk it takes.** A vault of hosts, keys and snippets is a few
+megabytes, so a household server stays in megabytes. The ceiling is set by
+`UWUSSH_SERVER_MAX_MB`: at the default 2 GiB, the database and seven backups
+of it come to about 16 GiB — 18 while a new backup is written and the oldest
+has not gone yet — plus a write-ahead log and thirty megabytes of container
+log. Lower it on a small disk.
 
 ## The protocol
 
@@ -177,10 +189,18 @@ the same crate the client uses, so a schema change is one edit in one place.
 | `GET /healthz`                               | Alive, and what schema it speaks                      |
 
 Limits it enforces without a key: 500 records or 8 MiB per request and per
-page, 256 KiB per record, what one account may hold, a handful of small
-messages per pairing, 64 KiB for every other request, two minutes for any of
-them — and rate limits per address where guessing would pay, and per account
-where one account could wear the server down for everybody else.
+page, 256 KiB per record, what one account may hold and what all of them
+together may, a handful of small messages per pairing, 64 KiB for every other
+request, two minutes for any of them — and rate limits per address where
+guessing would pay, and per account where one account could wear the server
+down for everybody else. Before a request is even read: fifteen seconds for
+its headers, fifteen for a connection that sits idle between two, 512
+connections at once and 32 from one address. An event stream that is being
+answered is none of those, and stays open.
+
+A vault header has to ask for a key derivation that costs at least 19 MiB and
+two passes of Argon2id, or the account is not made — the client uses 64 MiB
+and three.
 
 ## TLS
 

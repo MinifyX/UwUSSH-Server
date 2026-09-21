@@ -6,7 +6,7 @@
 # It updates itself first, then looks at compose.yaml, makes a backup, fetches the new image and
 # watches the server come back. If it does not come back, the old version does.
 #
-#   --dir DIR          where UwUSSH Server lives (default: this directory, then /opt/uwussh)
+#   --dir DIR          where UwUSSH Server lives (default: where this script is, then /opt/uwussh)
 #   --version TAG      switch to another tag: latest, beta, edge, or an exact version like 0.1.0
 #   --no-backup        do not back up first
 #   --force            take the new compose.yaml even when this one was changed by hand
@@ -24,7 +24,10 @@ repo=MinifyX/UwUSSH-Server
 releases="https://github.com/$repo/releases"
 image=ghcr.io/minifyx/uwussh-server
 service=uwussh
-here="$(cd "$(dirname "$0")" && pwd)"
+# Where this script is — when it is a file at all. Piped into bash, $0 is "bash", and "here"
+# would be wherever the shell happened to be.
+here=""
+[ -f "$0" ] && here="$(cd "$(dirname "$0")" && pwd -P)"
 
 # What we were called with, for the copy that takes over after a self-update.
 called_with=("$@")
@@ -146,20 +149,58 @@ looks_like_version() { case "${1:-}" in [0-9]*) return 0 ;; *) return 1 ;; esac;
 plain_value() { case "${1:-}" in "" | *[!a-zA-Z0-9.:_/+\[\]-]*) return 1 ;; *) return 0 ;; esac; }
 
 # ── where UwUSSH Server lives ─────────────────────────────────────────────────────────────────
-# Next to this script first: "sudo bash /opt/uwussh/update.sh" from somewhere else means that
-# one. And only a directory whose compose.yaml runs this server — never another project's.
+# Next to this script, or /opt/uwussh, or what --dir says — never wherever the shell happens to
+# be. "sudo bash /opt/uwussh/update.sh" from somewhere else means that one. And only a directory
+# whose compose.yaml runs this server — never another project's.
 ours() { [ -f "$1/compose.yaml" ] && [ -f "$1/.env" ] && grep -q "uwussh-server" "$1/compose.yaml"; }
 if [ -z "$dir" ]; then
-  for candidate in "$here" "$PWD" /opt/uwussh; do
-    if ours "$candidate"; then
+  for candidate in "$here" /opt/uwussh; do
+    if [ -n "$candidate" ] && ours "$candidate"; then
       dir="$candidate"
       break
     fi
   done
   [ -n "$dir" ] || die "no UwUSSH Server here. Pass --dir with the directory it runs from."
 fi
-dir="$(cd "$dir" 2>/dev/null && pwd)" || die "there is no directory $dir"
+dir="$(cd "$dir" 2>/dev/null && pwd -P)" || die "there is no directory $dir"
 ours "$dir" || die "$dir holds no compose.yaml for UwUSSH Server with an .env next to it"
+
+# What is in that directory runs as root: Compose starts whatever compose.yaml and .env say, and
+# .uwussh-update decides whether compose.yaml is replaced. So all of it has to belong to root, or
+# to the admin who ran sudo, and nobody else may write to it — nor to a directory above it, where
+# somebody could swap it out. A directory anybody may write to is fine above it only with the
+# sticky bit, which keeps them from renaming what is not theirs (/tmp, say).
+admin_uid="${SUDO_UID:-0}"
+owned_right() {
+  local owner mode
+  owner=$(stat -c %u "$1" 2>/dev/null) && mode=$(stat -c %a "$1" 2>/dev/null) || return 1
+  { [ "$owner" = 0 ] || [ "$owner" = "$admin_uid" ]; } || return 1
+  if [ $((8#$mode & 8#022)) -ne 0 ]; then
+    [ "${2:-}" = above ] || return 1
+    [ $((8#$mode & 8#1000)) -ne 0 ] || return 1
+  fi
+}
+untrusted() {
+  die "$1 may be changed by someone other than root$([ "$admin_uid" != 0 ] && printf ' and you'), and what is in $dir runs as root. $2"
+}
+owned_right "$dir" || untrusted "$dir" "Make it root's and writable only by root: sudo chown root: $dir && sudo chmod go-w $dir"
+for name in compose.yaml .env .uwussh-update; do
+  [ -e "$dir/$name" ] || [ -L "$dir/$name" ] || continue
+  [ -L "$dir/$name" ] && untrusted "$dir/$name" "It is a link; put the file itself there."
+  owned_right "$dir/$name" || untrusted "$dir/$name" "sudo chown root: $dir/$name && sudo chmod go-w $dir/$name"
+done
+above="$dir"
+while [ "$above" != / ]; do
+  above=$(dirname "$above")
+  owned_right "$above" above || untrusted "$above" "Update from a directory that only root may change, like /opt/uwussh."
+done
+
+# Compose reads settings of its own from .env: COMPOSE_FILE would run another file than this
+# compose.yaml, COMPOSE_PROJECT_NAME another project. None of that belongs in this .env.
+if grep -qE '^[[:space:]]*(export[[:space:]]+)?(COMPOSE_|DOCKER_)' "$dir/.env"; then
+  die "$dir/.env sets COMPOSE_ or DOCKER_ variables, which steer Compose itself rather than UwUSSH Server. Take them out, then run this again."
+fi
+
 cd "$dir" || die "cannot go into $dir"
 state="$dir/.uwussh-update"
 
@@ -260,6 +301,7 @@ running_image=$(docker inspect "$service" --format '{{.Image}}' 2>/dev/null)
 # move into .env; anything else somebody changed stops the update.
 lifted="UWUSSH_PUBLIC UWUSSH_REGISTRATION UWUSSH_TLS UWUSSH_TRUST_FORWARDED UWUSSH_UPDATE_CHECK"
 lifted="$lifted UWUSSH_MAX_ACCOUNTS UWUSSH_ACCOUNT_MAX_RECORDS UWUSSH_ACCOUNT_MAX_MB"
+lifted="$lifted UWUSSH_SERVER_MAX_MB UWUSSH_MAX_CONNECTIONS UWUSSH_MAX_CONNECTIONS_PER_IP"
 
 # shellcheck disable=SC2016  # the ${...} here are strings to compare against, not expansions
 lift_into_env() {

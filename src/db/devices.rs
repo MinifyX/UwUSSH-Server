@@ -136,6 +136,9 @@ pub fn revoke(conn: &Connection, account_id: Uuid, id: Uuid) -> rusqlite::Result
           WHERE id = ?1 AND account_id = ?2 AND revoked_ms IS NULL",
         params![id.to_string(), account_id.to_string(), now_ms() as i64],
     )?;
+    if changed > 0 {
+        crate::db::records::drop_manifests_of(conn, account_id, id)?;
+    }
     Ok(changed > 0)
 }
 

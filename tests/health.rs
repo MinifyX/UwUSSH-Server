@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 use uwussh_server::config::TlsMode;
 use uwussh_server::db::Db;
-use uwussh_server::{api, health, tls, AppState, Config};
+use uwussh_server::{api, connections, health, tls, AppState, Config};
 
 fn scratch() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("uwussh-health-{}", Uuid::now_v7()));
@@ -27,18 +27,16 @@ async fn serve_tls(data_dir: &std::path::Path) -> SocketAddr {
     .await
     .unwrap();
     let state = AppState::new(Db::open_in_memory().unwrap(), Config::default());
-    let app = api::router(state).into_make_service_with_connect_info::<SocketAddr>();
+    let limits = connections::Limits::from_config(&state.config);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let handle = Handle::new();
-    tokio::spawn({
-        let handle = handle.clone();
-        async move {
-            axum_server::bind_rustls("127.0.0.1:0".parse().unwrap(), config)
-                .handle(handle)
-                .serve(app)
-                .await
-                .unwrap();
-        }
-    });
+    tokio::spawn(connections::serve(
+        listener,
+        api::router(state),
+        Some(config),
+        limits,
+        handle.clone(),
+    ));
     handle.listening().await.expect("the server listens")
 }
 

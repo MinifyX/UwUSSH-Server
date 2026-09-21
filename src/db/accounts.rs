@@ -26,6 +26,45 @@ pub fn plausible(header: &VaultHeader) -> bool {
         && !header.wrapped_blob.is_empty()
 }
 
+/// The cheapest Argon2id a vault header may ask for: OWASP's lowest setting,
+/// 19 MiB and two passes. The header is the client's to write, and a vault
+/// derived at 1 KiB and one pass would make the wrapped key in this database
+/// cheap to guess against — the account key aside, which is the client's to
+/// get right too. So both halves hold the line.
+///
+/// Only checked where a header comes in: a new account, a new password. A
+/// header already stored is handed back as it is, whatever it asks for — a
+/// vault must not become impossible to open because the floor moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KdfFloor {
+    pub memory_kib: u32,
+    pub time_cost: u32,
+}
+
+impl Default for KdfFloor {
+    fn default() -> Self {
+        Self {
+            memory_kib: 19 * 1024,
+            time_cost: 2,
+        }
+    }
+}
+
+impl KdfFloor {
+    /// Whether a header costs at least this much to derive. The reason, when
+    /// not, in words a person can act on.
+    pub fn check(&self, header: &VaultHeader) -> Result<(), String> {
+        if header.kdf_memory_kib < self.memory_kib || header.kdf_time_cost < self.time_cost {
+            return Err(format!(
+                "the vault's key derivation is too cheap to guess against: this server wants at \
+                 least {} KiB of memory and {} passes, and got {} KiB and {}",
+                self.memory_kib, self.time_cost, header.kdf_memory_kib, header.kdf_time_cost
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Account {
     pub id: Uuid,
@@ -245,6 +284,28 @@ pub(crate) mod tests {
         greedy.kdf_memory_kib = u32::MAX;
         assert!(!plausible(&greedy));
         assert!(plausible(&header()));
+    }
+
+    #[test]
+    fn a_header_below_the_floor_is_refused_and_one_at_it_is_not() {
+        let floor = KdfFloor::default();
+        assert!(floor.check(&header()).is_ok(), "what the client uses");
+
+        let at = VaultHeader {
+            kdf_memory_kib: 19 * 1024,
+            kdf_time_cost: 2,
+            ..header()
+        };
+        assert!(floor.check(&at).is_ok());
+        for (memory, passes) in [(1, 1), (19 * 1024 - 1, 3), (65536, 1), (8, 1)] {
+            let cheap = VaultHeader {
+                kdf_memory_kib: memory,
+                kdf_time_cost: passes,
+                ..header()
+            };
+            let refused = floor.check(&cheap).unwrap_err();
+            assert!(refused.contains("19456 KiB"), "{refused}");
+        }
     }
 
     #[test]

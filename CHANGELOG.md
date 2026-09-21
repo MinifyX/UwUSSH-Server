@@ -3,6 +3,45 @@
 Each release gets a section here before its tag is pushed; CI copies the section into the GitHub
 release. Versions follow semver; `-beta.N` versions are pre-releases.
 
+## 0.1.1
+
+**Security fixes.** A second look at 0.1.0 found ways to wear the server down, fill its disk, or
+— from a directory someone else could write to — turn `update.sh` against its own machine.
+Nothing that let anybody read a record or reach another account. Every one is fixed, most with a
+test.
+
+- **Connections have deadlines and a ceiling.** A client that opened a connection and then said
+  nothing, or sent its headers a byte at a time, or sat idle after its last request, held a socket
+  for as long as it liked; a few thousand of those were a server nobody else could reach. Now the
+  headers of a request get fifteen seconds, an idle connection fifteen more, HTTP/2 connections are
+  pinged and dropped when nobody answers, and the server takes 512 connections at once and 32 from
+  one address (`UWUSSH_MAX_CONNECTIONS`, `UWUSSH_MAX_CONNECTIONS_PER_IP`; behind a proxy only the
+  total counts). An event stream being answered is left alone. On Linux the server also raises its
+  own open-file limit as far as the system allows.
+- **The disk cannot be filled through the backups.** The quota was per account, and fourteen
+  nightly backups each copied all of it. Now all accounts together hold at most
+  `UWUSSH_SERVER_MAX_MB` (2 GiB by default), seven backups are kept instead of fourteen, and a
+  backup that would leave the disk without room to spare is skipped with a warning. At the
+  defaults, the database and its backups top out around 16 GiB.
+- **`update.sh` only trusts what only root can change.** It looked for the server in the directory
+  the shell was in, and ran whatever `compose.yaml` and `.env` it found there. Now it looks beside
+  itself, in `/opt/uwussh` or where `--dir` says; refuses a directory, `compose.yaml`, `.env` or
+  `.uwussh-update` that anybody but root (or the admin running `sudo`) could write to, or that sits
+  under a directory someone else could; and refuses a `.env` that sets `COMPOSE_…` or `DOCKER_…`
+  variables.
+- **A device holds at most eight session tokens.** Signing in again and again piled up tokens in
+  memory without end; now the oldest goes, and expired ones are swept every few minutes.
+- **A vault must be expensive to guess against.** The server took a vault header asking for
+  Argon2id at 1 KiB and one pass. It now wants at least 19 MiB and two passes for a new account or
+  a new master password; the client uses 64 MiB and three. Vaults already on the server are not
+  touched.
+
+**Manifests, for UwUSSH 0.1.1.** The client now has each device publish a sealed list of what it
+holds, so a device can tell when a server serves it old versions or holds records back. The server
+stores them like any other record; it hands them only to clients that ask (`manifests=1`), so an
+older client keeps syncing, and it drops a device's manifest when the device is revoked. UwUSSH
+0.1.1 and this server belong together: update both.
+
 ## 0.1.0
 
 **The first release.** A sync server for [UwUSSH](https://github.com/MinifyX/UwUSSH-Client): your

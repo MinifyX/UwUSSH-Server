@@ -154,7 +154,10 @@ trust the certificate the usual way.
 `X-Forwarded-For` rather than the proxy's, and it takes the **last** one there,
 which is the one your proxy adds. Never switch it on for a server that is
 reachable without the proxy: anyone could then choose the address they are
-counted under.
+counted under. It also switches off the limit on connections from one address
+(`UWUSSH_MAX_CONNECTIONS_PER_IP`), since every connection comes from the proxy;
+the total, `UWUSSH_MAX_CONNECTIONS`, still holds, and the proxy is the place to
+limit per client.
 
 The proxy has to pass on the event stream (`/v1/events`) without buffering it,
 and hold a request for at least half a minute: pairing waits up to 20 seconds
@@ -235,9 +238,16 @@ The way back pins the exact version in `.env`: a server that followed
 `latest` follows `0.1.0` afterwards. Take that line back to `latest` once the
 trouble is understood.
 
-`update.sh` works on the directory it sits in (or `--dir`), and only on one
-whose `compose.yaml` runs UwUSSH Server — never on another project because
-that is where the shell happened to be.
+`update.sh` works on the directory it sits in, `/opt/uwussh`, or `--dir` —
+never on the directory the shell happens to be in — and only on one whose
+`compose.yaml` runs UwUSSH Server. What is in that directory runs as root, so
+it also has to be safe to trust: the directory, `compose.yaml`, `.env` and
+`.uwussh-update` belong to root (or to the admin who ran `sudo`), nobody else
+may write to them or to a directory above them, and none of the files is a
+link. A `.env` that sets `COMPOSE_…` or `DOCKER_…` variables — which would
+steer Compose to another file or project — is refused too. `install.sh` sets
+everything up that way; `update.sh` stops and says what to change when
+something is not.
 
 ### What you trust when you update
 
@@ -262,11 +272,19 @@ server ever opens on its own.
 
 ## Backups
 
-The server writes a backup of its database every night and keeps the newest
-fourteen, plus one before every update, all under `backups/` in its volume. They
-are written with `VACUUM INTO`, which gives a consistent copy of a live
-database — copying the file itself would miss what is still in the write-ahead
-log.
+The server writes a backup of its database every night, and one before every
+update, all under `backups/` in its volume; the newest seven are kept. They are
+written with `VACUUM INTO`, which gives a consistent copy of a live database —
+copying the file itself would miss what is still in the write-ahead log.
+
+Each backup is a whole copy, so they take seven times the database. A backup
+that would leave less than a twentieth of the disk free (and at least 256 MiB)
+is not written: the log says `no backup tonight`, and `uwussh-server backup`
+refuses the same way. What the database can grow to is capped by
+`UWUSSH_SERVER_MAX_MB` — 2 GiB by default, for all accounts together — which
+puts the ceiling at about 16 GiB for the database and its backups (18 for the
+moment a new one is written before the oldest goes). A household server with a
+few vaults uses megabytes.
 
 A backup holds only what the server holds: sealed records it cannot read, and
 vault headers that are useless without the master password **and** the account

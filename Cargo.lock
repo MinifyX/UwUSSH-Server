@@ -2491,8 +2491,8 @@ dependencies = [
 
 [[package]]
 name = "uwussh-proto"
-version = "0.1.0-beta.7"
-source = "git+https://github.com/MinifyX/UwUSSH-Client.git?rev=f8833affd8113767e2c83d9e094c71326e4f6396#f8833affd8113767e2c83d9e094c71326e4f6396"
+version = "0.1.0-beta.10"
+source = "git+https://github.com/MinifyX/UwUSSH-Client.git?rev=0671b0a840cfa9c4ea11a841acb697f620f99479#0671b0a840cfa9c4ea11a841acb697f620f99479"
 dependencies = [
  "serde",
  "serde_json",
@@ -2501,7 +2501,7 @@ dependencies = [
 
 [[package]]
 name = "uwussh-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "axum-server",
@@ -2509,6 +2509,7 @@ dependencies = [
  "clap",
  "ed25519-dalek 2.2.0",
  "futures-core",
+ "hyper-util",
  "libc",
  "parking_lot",
  "rand",
@@ -2537,8 +2538,8 @@ dependencies = [
 
 [[package]]
 name = "uwussh-store"
-version = "0.1.0-beta.7"
-source = "git+https://github.com/MinifyX/UwUSSH-Client.git?rev=f8833affd8113767e2c83d9e094c71326e4f6396#f8833affd8113767e2c83d9e094c71326e4f6396"
+version = "0.1.0-beta.10"
+source = "git+https://github.com/MinifyX/UwUSSH-Client.git?rev=0671b0a840cfa9c4ea11a841acb697f620f99479#0671b0a840cfa9c4ea11a841acb697f620f99479"
 dependencies = [
  "base64 0.22.1",
  "parking_lot",
@@ -2546,6 +2547,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "thiserror 1.0.69",
  "tracing",
  "uuid",
@@ -2556,8 +2558,8 @@ dependencies = [
 
 [[package]]
 name = "uwussh-sync"
-version = "0.1.0-beta.7"
-source = "git+https://github.com/MinifyX/UwUSSH-Client.git?rev=f8833affd8113767e2c83d9e094c71326e4f6396#f8833affd8113767e2c83d9e094c71326e4f6396"
+version = "0.1.0-beta.10"
+source = "git+https://github.com/MinifyX/UwUSSH-Client.git?rev=0671b0a840cfa9c4ea11a841acb697f620f99479#0671b0a840cfa9c4ea11a841acb697f620f99479"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 3.0.0",
@@ -2571,6 +2573,7 @@ dependencies = [
  "spake2",
  "thiserror 1.0.69",
  "tracing",
+ "url",
  "uuid",
  "uwussh-proto",
  "uwussh-store",
@@ -2582,8 +2585,8 @@ dependencies = [
 
 [[package]]
 name = "uwussh-vault"
-version = "0.1.0-beta.7"
-source = "git+https://github.com/MinifyX/UwUSSH-Client.git?rev=f8833affd8113767e2c83d9e094c71326e4f6396#f8833affd8113767e2c83d9e094c71326e4f6396"
+version = "0.1.0-beta.10"
+source = "git+https://github.com/MinifyX/UwUSSH-Client.git?rev=0671b0a840cfa9c4ea11a841acb697f620f99479#0671b0a840cfa9c4ea11a841acb697f620f99479"
 dependencies = [
  "argon2",
  "chacha20poly1305",

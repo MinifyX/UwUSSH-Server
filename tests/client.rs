@@ -16,6 +16,7 @@ use std::net::SocketAddr;
 use std::sync::mpsc;
 use uwussh_proto::api::{CreateAccount, EnrolDevice, NewDevice};
 use uwussh_server::config::Registration;
+use uwussh_server::db::accounts::KdfFloor;
 use uwussh_server::db::Db;
 use uwussh_server::{api, b64, random_bytes, AppState, Config};
 use uwussh_store::{AuthMethod, HostDraft, PasswordChange, SecretText, Store};
@@ -45,6 +46,12 @@ fn start_with(registration: Registration) -> Running {
         runtime.block_on(async move {
             let config = Config {
                 registration,
+                // The cheap parameters above are below what the server takes
+                // from a real client.
+                kdf_floor: KdfFloor {
+                    memory_kib: KDF.memory_kib,
+                    time_cost: KDF.time_cost,
+                },
                 ..Config::default()
             };
             let state = AppState::new(Db::open_in_memory().expect("a database"), config);

@@ -755,6 +755,7 @@ async fn an_account_holds_what_the_server_allows_and_no_more() {
         quota: uwussh_server::db::records::Quota {
             records: 3,
             bytes: 1024 * 1024,
+            ..Default::default()
         },
         ..Config::default()
     })
@@ -946,6 +947,52 @@ async fn changing_the_master_password_takes_the_old_one() {
     };
     assert_eq!(join("master").await.unwrap().status(), 401);
     assert_eq!(join("new").await.unwrap().status(), 200);
+}
+
+#[tokio::test]
+async fn a_vault_too_cheap_to_guess_against_is_not_taken() {
+    let server = start(Registration::Open).await;
+    let mut cheap = Server::vault(Uuid::now_v7());
+    cheap["kdfMemoryKib"] = json!(1024);
+    cheap["kdfTimeCost"] = json!(1);
+    let response = server
+        .client
+        .post(server.url("/v1/accounts"))
+        .json(&json!({
+            "vault": cheap,
+            "authKey": login_key("master"),
+            "device": { "name": "x", "publicKey": uwussh_server::b64::encode([6u8; 32]) },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert!(
+        response.text().await.unwrap().contains("too cheap"),
+        "and says why"
+    );
+    assert_eq!(
+        uwussh_server::db::accounts::count(&server.state.db.lock()).unwrap(),
+        0
+    );
+
+    // Nor as a new password on an account that is fine.
+    let device = Device::create_account(&server, "", "master", 1).await;
+    let mut cheap = Server::vault(device.vault_id);
+    cheap["kdfTimeCost"] = json!(1);
+    let response = server
+        .client
+        .put(server.url("/v1/vault/key"))
+        .bearer_auth(&device.token)
+        .json(&json!({
+            "currentAuthKey": login_key("master"),
+            "vault": cheap,
+            "authKey": login_key("new"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
 }
 
 #[tokio::test]

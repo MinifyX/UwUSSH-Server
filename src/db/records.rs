@@ -22,10 +22,16 @@ use uwussh_proto::{
 /// What one account may hold. A vault of hosts, keys and snippets is a few
 /// megabytes; this is room for a hundred times that, and still means one
 /// account cannot fill the disk of a machine that others sync to as well.
+///
+/// And what every account together may hold, because a hundred accounts at
+/// their quota are 25 GiB — and every nightly backup is another copy of all of
+/// it. The server-wide cap is what the disk really has to have room for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Quota {
     pub records: u64,
     pub bytes: u64,
+    /// Sealed bytes of every account on this server together.
+    pub server_bytes: u64,
 }
 
 impl Default for Quota {
@@ -33,6 +39,7 @@ impl Default for Quota {
         Self {
             records: 100_000,
             bytes: 256 * 1024 * 1024,
+            server_bytes: 2 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -91,9 +98,10 @@ pub fn push(
     push_within(conn, account, device, envelopes, Quota::default())
 }
 
-/// [`push`], held to what the account may hold. A push that would take it
-/// past that is refused whole; one that makes it smaller — a delete, say —
-/// always goes through, even for an account that is over.
+/// [`push`], held to what the account may hold and what the server holds in
+/// all. A push that would take either past that is refused whole; one that
+/// makes the account smaller — a delete, say — always goes through, even for
+/// an account that is over, or on a server that is full.
 pub fn push_within(
     conn: &mut Connection,
     account: &Account,
@@ -196,6 +204,26 @@ pub fn push_within(
             quota.bytes / (1024 * 1024)
         )));
     }
+    if bytes > held_bytes {
+        // Every account but this one as it was, and this one as it would be.
+        // Read inside the transaction, so two accounts pushing at once cannot
+        // both squeeze under the line.
+        let everyone: i64 = tx.query_row(
+            "SELECT coalesce(sum(record_bytes), 0) FROM accounts",
+            [],
+            |row| row.get(0),
+        )?;
+        if (everyone - held_bytes + bytes).max(0) as u64 > quota.server_bytes {
+            tracing::warn!(
+                limit_mib = quota.server_bytes / (1024 * 1024),
+                "the server holds as much as it is allowed to; pushes that add are refused"
+            );
+            return Err(ApiError::TooLarge(format!(
+                "this server holds as much as it allows ({} MiB for all accounts together)",
+                quota.server_bytes / (1024 * 1024)
+            )));
+        }
+    }
     tx.execute(
         "UPDATE accounts SET seq = ?2, record_count = ?3, record_bytes = ?4 WHERE id = ?1",
         params![account.id.to_string(), seq, records, bytes],
@@ -214,30 +242,39 @@ pub fn push_within(
 /// and the reading stops there: five hundred records at the largest size
 /// would be 128 MiB in memory for one request, and a few of those at once
 /// take down a small machine.
+///
+/// `manifests` says whether the device reads manifests. For one that doesn't,
+/// they are passed over — the cursor still moves past them, so it never asks
+/// for them again.
 pub fn pull(
     conn: &Connection,
     account: &Account,
     since: u64,
     limit: usize,
+    manifests: bool,
 ) -> Result<PullResponse> {
     let limit = limit.clamp(1, MAX_BATCH);
+    // No LIMIT in SQL: rows passed over don't count towards the page, and the
+    // loop stops reading once the page is full.
     let mut stmt = conn.prepare(
         "SELECT id, kind, seq, hlc_wall_ms, hlc_counter, hlc_device, deleted, nonce, blob
            FROM records
           WHERE account_id = ?1 AND seq > ?2
-          ORDER BY seq
-          LIMIT ?3",
+          ORDER BY seq",
     )?;
-    // One more than asked for, to find out whether there is another page.
-    let rows = stmt.query_map(
-        params![account.id.to_string(), since as i64, limit as i64 + 1],
-        |row| row_to_envelope(account, row),
-    )?;
+    let rows = stmt.query_map(params![account.id.to_string(), since as i64], |row| {
+        row_to_envelope(account, row)
+    })?;
     let mut envelopes = Vec::new();
     let mut bytes = 0;
     let mut has_more = false;
+    let mut cursor = since;
     for row in rows {
         let envelope = row?;
+        if !manifests && envelope.kind == EntityKind::Manifest {
+            cursor = envelope.seq.unwrap_or(cursor).max(cursor);
+            continue;
+        }
         if envelopes.len() == limit
             || (!envelopes.is_empty() && bytes + envelope.blob.len() > MAX_BATCH_BYTES)
         {
@@ -245,12 +282,9 @@ pub fn pull(
             break;
         }
         bytes += envelope.blob.len();
+        cursor = envelope.seq.unwrap_or(cursor).max(cursor);
         envelopes.push(envelope);
     }
-    let cursor = envelopes
-        .last()
-        .and_then(|envelope| envelope.seq)
-        .unwrap_or(since);
 
     Ok(PullResponse {
         envelopes,
@@ -335,6 +369,41 @@ pub fn purge_tombstones(
     Ok(removed)
 }
 
+/// Forget the manifests a device published. Once it is revoked, nothing it
+/// said is kept up to date any more: after old tombstones are purged, its last
+/// manifest would name records a newly joined device can never receive, and
+/// that device would take the gap for a server holding them back.
+pub fn drop_manifests_of(
+    conn: &Connection,
+    account_id: Uuid,
+    device_id: Uuid,
+) -> rusqlite::Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    let which = params![
+        account_id.to_string(),
+        device_id.to_string(),
+        kind_name(EntityKind::Manifest)
+    ];
+    let (count, bytes): (i64, i64) = tx.query_row(
+        "SELECT count(*), coalesce(sum(length(blob)), 0) FROM records
+          WHERE account_id = ?1 AND device_id = ?2 AND kind = ?3",
+        which,
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let removed = tx.execute(
+        "DELETE FROM records WHERE account_id = ?1 AND device_id = ?2 AND kind = ?3",
+        which,
+    )?;
+    tx.execute(
+        "UPDATE accounts
+            SET record_count = max(record_count - ?2, 0), record_bytes = max(record_bytes - ?3, 0)
+          WHERE id = ?1",
+        params![account_id.to_string(), count, bytes],
+    )?;
+    tx.commit()?;
+    Ok(removed)
+}
+
 /// How many records an account holds, and how many sealed bytes.
 pub fn usage(conn: &Connection, account: &Account) -> rusqlite::Result<(u64, u64)> {
     conn.query_row(
@@ -385,13 +454,13 @@ pub(crate) mod tests {
             push_within(&mut conn, &account, device, &batch[5..], Quota::default()).unwrap();
         }
 
-        let first = pull(&conn, &account, 0, MAX_BATCH).unwrap();
+        let first = pull(&conn, &account, 0, MAX_BATCH, true).unwrap();
         let bytes: usize = first.envelopes.iter().map(|env| env.blob.len()).sum();
         assert!(bytes <= MAX_BATCH_BYTES, "{bytes}");
         assert_eq!(first.envelopes.len(), MAX_BATCH_BYTES / MAX_BLOB_BYTES);
         assert!(first.has_more);
 
-        let second = pull(&conn, &account, first.cursor.0, MAX_BATCH).unwrap();
+        let second = pull(&conn, &account, first.cursor.0, MAX_BATCH, true).unwrap();
         assert_eq!(first.envelopes.len() + second.envelopes.len(), 40);
         assert!(!second.has_more);
     }
@@ -419,6 +488,7 @@ pub(crate) mod tests {
         let quota = Quota {
             records: 2,
             bytes: 1024,
+            ..Quota::default()
         };
         let one = sized(&account, 400);
         let two = sized(&account, 400);
@@ -454,6 +524,57 @@ pub(crate) mod tests {
         assert_eq!(usage(&conn, &account).unwrap(), (2, 416));
     }
 
+    #[test]
+    fn all_accounts_together_hold_no_more_than_the_server_allows() {
+        let db = Db::open_in_memory().unwrap();
+        let mut conn = db.lock();
+        let mine = account(&conn);
+        let theirs = accounts::create(&conn, &accounts::tests::header(), b"other").unwrap();
+        let device = Uuid::now_v7();
+        let quota = Quota {
+            server_bytes: 1000,
+            ..Quota::default()
+        };
+        let first = sized(&mine, 600);
+        push_within(
+            &mut conn,
+            &mine,
+            device,
+            std::slice::from_ref(&first),
+            quota,
+        )
+        .unwrap();
+
+        // Well inside its own quota, and still one too many for the server.
+        assert!(matches!(
+            push_within(&mut conn, &theirs, device, &[sized(&theirs, 500)], quota),
+            Err(ApiError::TooLarge(message)) if message.contains("all accounts")
+        ));
+        assert_eq!(
+            usage(&conn, &theirs).unwrap(),
+            (0, 0),
+            "nothing of it stayed"
+        );
+        push_within(&mut conn, &theirs, device, &[sized(&theirs, 400)], quota).unwrap();
+
+        // Full now. Growing is refused, shrinking is not, and what shrinking
+        // freed is there for the other account.
+        let bigger = Envelope {
+            blob: vec![1; 601],
+            base_seq: 1,
+            ..first.clone()
+        };
+        assert!(push_within(&mut conn, &mine, device, &[bigger], quota).is_err());
+        let smaller = Envelope {
+            blob: vec![1; 100],
+            base_seq: 1,
+            deleted: true,
+            ..first
+        };
+        push_within(&mut conn, &mine, device, &[smaller], quota).unwrap();
+        push_within(&mut conn, &theirs, device, &[sized(&theirs, 500)], quota).unwrap();
+    }
+
     fn envelope(account: &Account, id: Uuid, base_seq: u64) -> Envelope {
         Envelope {
             id,
@@ -482,7 +603,7 @@ pub(crate) mod tests {
         assert!(response.conflicts.is_empty());
         assert_eq!(response.cursor, SyncCursor(1));
 
-        let page = pull(&conn, &account, 0, 10).unwrap();
+        let page = pull(&conn, &account, 0, 10, true).unwrap();
         assert_eq!(page.envelopes.len(), 1);
         assert_eq!(page.envelopes[0].id, id);
         assert_eq!(page.envelopes[0].seq, Some(1));
@@ -492,7 +613,7 @@ pub(crate) mod tests {
         assert_eq!(page.cursor, SyncCursor(1));
 
         // And nothing comes twice.
-        let again = pull(&conn, &account, 1, 10).unwrap();
+        let again = pull(&conn, &account, 1, 10, true).unwrap();
         assert!(again.envelopes.is_empty());
         assert_eq!(again.cursor, SyncCursor(1));
     }
@@ -577,16 +698,16 @@ pub(crate) mod tests {
             .unwrap();
         }
 
-        let page = pull(&conn, &account, 0, 2).unwrap();
+        let page = pull(&conn, &account, 0, 2, true).unwrap();
         assert_eq!(page.envelopes.len(), 2);
         assert!(page.has_more);
         assert_eq!(page.cursor, SyncCursor(2));
 
-        let page = pull(&conn, &account, page.cursor.0, 2).unwrap();
+        let page = pull(&conn, &account, page.cursor.0, 2, true).unwrap();
         assert_eq!(page.envelopes.len(), 2);
         assert!(page.has_more);
 
-        let page = pull(&conn, &account, page.cursor.0, 2).unwrap();
+        let page = pull(&conn, &account, page.cursor.0, 2, true).unwrap();
         assert_eq!(page.envelopes.len(), 1);
         assert!(!page.has_more, "the last page says so");
     }
@@ -606,7 +727,10 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        assert!(pull(&conn, &mine, 0, 10).unwrap().envelopes.is_empty());
+        assert!(pull(&conn, &mine, 0, 10, true)
+            .unwrap()
+            .envelopes
+            .is_empty());
         assert_eq!(count(&conn, &mine).unwrap(), 0);
         assert_eq!(count(&conn, &theirs).unwrap(), 1);
     }
@@ -720,8 +844,90 @@ pub(crate) mod tests {
             EntityKind::KnownHost,
             EntityKind::TerminalProfile,
             EntityKind::Secret,
+            EntityKind::Manifest,
         ] {
             assert_eq!(kind_from(&kind_name(kind)), Some(kind), "{kind:?}");
         }
+    }
+
+    fn manifest(account: &Account) -> Envelope {
+        Envelope {
+            kind: EntityKind::Manifest,
+            ..envelope(account, Uuid::now_v7(), 0)
+        }
+    }
+
+    #[test]
+    fn a_client_from_before_manifests_never_sees_one_and_still_gets_past_them() {
+        let db = Db::open_in_memory().unwrap();
+        let mut conn = db.lock();
+        let account = account(&conn);
+        let device = Uuid::now_v7();
+        let host = envelope(&account, Uuid::now_v7(), 0);
+        push(
+            &mut conn,
+            &account,
+            device,
+            &[manifest(&account), host.clone(), manifest(&account)],
+        )
+        .unwrap();
+
+        let old = pull(&conn, &account, 0, 10, false).unwrap();
+        assert_eq!(old.envelopes.len(), 1);
+        assert_eq!(old.envelopes[0].id, host.id);
+        assert_eq!(old.cursor.0, 3, "the cursor moves past the manifests too");
+        assert!(!old.has_more);
+
+        let new = pull(&conn, &account, 0, 10, true).unwrap();
+        assert_eq!(new.envelopes.len(), 3);
+
+        // A page of nothing but manifests is an empty page for the old one.
+        let rest = pull(&conn, &account, 2, 10, false).unwrap();
+        assert!(rest.envelopes.is_empty());
+    }
+
+    #[test]
+    fn manifests_passed_over_do_not_fill_the_page() {
+        let db = Db::open_in_memory().unwrap();
+        let mut conn = db.lock();
+        let account = account(&conn);
+        let device = Uuid::now_v7();
+        let mut batch: Vec<Envelope> = (0..5).map(|_| manifest(&account)).collect();
+        batch.push(envelope(&account, Uuid::now_v7(), 0));
+        batch.push(envelope(&account, Uuid::now_v7(), 0));
+        push(&mut conn, &account, device, &batch).unwrap();
+
+        let page = pull(&conn, &account, 0, 1, false).unwrap();
+        assert_eq!(page.envelopes.len(), 1);
+        assert!(page.has_more);
+        let page = pull(&conn, &account, page.cursor.0, 1, false).unwrap();
+        assert_eq!(page.envelopes.len(), 1);
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn a_revoked_device_takes_its_manifest_along_and_nothing_else() {
+        let db = Db::open_in_memory().unwrap();
+        let mut conn = db.lock();
+        let account = account(&conn);
+        let gone = Uuid::now_v7();
+        let stays = Uuid::now_v7();
+        push(
+            &mut conn,
+            &account,
+            gone,
+            &[manifest(&account), envelope(&account, Uuid::now_v7(), 0)],
+        )
+        .unwrap();
+        push(&mut conn, &account, stays, &[manifest(&account)]).unwrap();
+
+        assert_eq!(drop_manifests_of(&conn, account.id, gone).unwrap(), 1);
+        let left = pull(&conn, &account, 0, 10, true).unwrap();
+        assert_eq!(
+            left.envelopes.len(),
+            2,
+            "its host and the other device's manifest"
+        );
+        assert_eq!(usage(&conn, &account).unwrap().0, 2);
     }
 }
