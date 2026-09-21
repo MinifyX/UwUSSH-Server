@@ -12,7 +12,7 @@ rust-version = "1.89"
 # The wire format, the clock and the conflict rule, straight from the client:
 # one definition, so client and server cannot drift apart. Pinned to a commit —
 # `cargo update -p uwussh-proto` after bumping this is a deliberate act.
-uwussh-proto = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "1460a650476e36e93a15ffd728cf225bad76e341" }
+uwussh-proto = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "f8833affd8113767e2c83d9e094c71326e4f6396" }
 
 axum = { version = "0.8", features = ["json"] }
 base64 = "0.22"
@@ -31,7 +31,7 @@ sha2 = "0.10"
 thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
-tower-http = { version = "0.6", features = ["limit", "trace"] }
+tower-http = { version = "0.6", features = ["limit", "timeout", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
@@ -39,16 +39,27 @@ rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "
 axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 time = { version = "0.3.55", default-features = false, features = ["std"] }
+# Two clients, both on rustls with `ring` and a TLS configuration of their own:
+# the health check, which only trusts this server's key, and the daily look at
+# GitHub's releases, which trusts the usual roots.
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
+webpki-roots = "1.0.9"
+
+[target.'cfg(unix)'.dependencies]
+# umask, so nothing the server writes is readable by other users.
+libc = "0.2"
 
 [dev-dependencies]
 # No TLS feature: the tests talk to a server on localhost over plain HTTP.
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 # The real client, so one test can drive both halves of the protocol against
 # each other instead of trusting that they agree.
-uwussh-store = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "1460a650476e36e93a15ffd728cf225bad76e341" }
-uwussh-sync = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "1460a650476e36e93a15ffd728cf225bad76e341" }
-uwussh-vault = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "1460a650476e36e93a15ffd728cf225bad76e341" }
+uwussh-store = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "f8833affd8113767e2c83d9e094c71326e4f6396" }
+uwussh-sync = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "f8833affd8113767e2c83d9e094c71326e4f6396" }
+uwussh-vault = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "f8833affd8113767e2c83d9e094c71326e4f6396" }
 zeroize = "1.9.0"
+# Time that runs on by itself, for what waits half a minute.
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 codegen-units = 1

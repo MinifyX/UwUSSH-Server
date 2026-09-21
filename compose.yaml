@@ -1,24 +1,57 @@
-# The whole server. One container, one folder.
+# UwUSSH Server
+#
+# install.sh sets all of this up for you. By hand it is:
+#
+#   1. cp .env.example .env   and set UWUSSH_PUBLIC to how your devices reach this machine
+#   2. docker compose up -d
+#   3. docker compose logs uwussh | grep uwu1_
+#   4. paste that setup code into UwUSSH under Settings → Sync
+#
+# The next version: update.sh, next to this file. Everything that differs from one machine to
+# the next lives in .env, so update.sh can put the next version's compose.yaml here.
+#
+# The whole story, with a reverse proxy, backups and updates: docs/deployment.md.
+
+name: uwussh
+
 services:
   uwussh:
-    image: ghcr.io/minifyx/uwussh-server:latest
-    # Or build it yourself:
-    # build: .
+    image: ghcr.io/minifyx/uwussh-server:${UWUSSH_VERSION:-latest}
+    container_name: uwussh
     restart: unless-stopped
-    ports:
-      - '8443:8443'
-    volumes:
-      - ./data:/data
     environment:
-      # How your devices reach this machine. It goes into the setup code, so
-      # set it to what you would type — not to 0.0.0.0.
-      UWUSSH_PUBLIC: nas.lan:8443
-      # open | invite | closed. With `invite`, the first start writes a setup
-      # code to the log: docker compose logs uwussh
-      UWUSSH_REGISTRATION: invite
-      # auto: the server makes its own certificate and tells you the
-      # fingerprint your devices pin. Turn it off when something in front
-      # already does the TLS — and then believe that proxy's header:
-      # UWUSSH_TLS: 'off'
-      # UWUSSH_TRUST_FORWARDED: '1'
-      UWUSSH_TLS: auto
+      UWUSSH_PUBLIC: ${UWUSSH_PUBLIC:?set UWUSSH_PUBLIC in .env}
+      UWUSSH_REGISTRATION: ${UWUSSH_REGISTRATION:-invite}
+      UWUSSH_TLS: ${UWUSSH_TLS:-auto}
+      UWUSSH_TRUST_FORWARDED: ${UWUSSH_TRUST_FORWARDED:-off}
+      UWUSSH_UPDATE_CHECK: ${UWUSSH_UPDATE_CHECK:-on}
+      UWUSSH_MAX_ACCOUNTS: ${UWUSSH_MAX_ACCOUNTS:-100}
+      UWUSSH_ACCOUNT_MAX_RECORDS: ${UWUSSH_ACCOUNT_MAX_RECORDS:-100000}
+      UWUSSH_ACCOUNT_MAX_MB: ${UWUSSH_ACCOUNT_MAX_MB:-256}
+      # What counts as an update is what this machine follows.
+      UWUSSH_CHANNEL: ${UWUSSH_VERSION:-latest}
+    ports:
+      - "${UWUSSH_BIND:-8443}:8443"   # the devices, over the server's own TLS
+    volumes:
+      - uwussh-data:/data
+    stop_grace_period: 10s
+    # Docker keeps a container's log for ever unless told otherwise, and somebody knocking a few
+    # hundred times a second writes a lot of it. Thirty megabytes, then the oldest goes.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Hardening: the server runs as an unprivileged user (uid 10001) on a read-only root file
+    # system; only the data volume and a small /tmp are writable. It listens above 1024, so it
+    # keeps no Linux capability at all.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  uwussh-data:

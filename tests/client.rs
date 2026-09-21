@@ -262,33 +262,53 @@ fn the_relay_carries_what_the_two_devices_say_to_each_other() {
     assert_eq!(session.id.len(), 5, "a code somebody reads out loud");
     let joining = Server::connect(&running.url, None).unwrap();
 
-    server.pair_send(&session.id, "a", b"spake from a").unwrap();
+    // Side a signs in as the device that opened it; side b holds its side
+    // with a secret it made up.
+    let claim = Some("the joining device's own secret");
+    server
+        .pair_send(&session.id, "a", None, b"spake from a")
+        .unwrap();
     assert!(
         server
-            .pair_receive(&session.id, "a", 0, false)
+            .pair_receive(&session.id, "a", None, 0, false)
             .unwrap()
             .is_empty(),
         "a device does not hear itself"
     );
     assert_eq!(
-        joining.pair_receive(&session.id, "b", 0, false).unwrap(),
+        joining
+            .pair_receive(&session.id, "b", claim, 0, false)
+            .unwrap(),
         vec![b"spake from a".to_vec()]
     );
 
     joining
-        .pair_send(&session.id, "b", b"spake from b")
+        .pair_send(&session.id, "b", claim, b"spake from b")
         .unwrap();
     server
-        .pair_send(&session.id, "a", b"the sealed account key")
+        .pair_send(&session.id, "a", None, b"the sealed account key")
         .unwrap();
     assert_eq!(
-        joining.pair_receive(&session.id, "b", 1, false).unwrap(),
+        joining
+            .pair_receive(&session.id, "b", claim, 1, false)
+            .unwrap(),
         vec![b"the sealed account key".to_vec()],
         "and only what it has not seen yet"
     );
 
+    // Somebody else who learned the id speaks for neither side.
+    let stranger = Server::connect(&running.url, None).unwrap();
+    assert!(stranger
+        .pair_send(&session.id, "a", None, b"me too")
+        .is_err());
+    assert!(stranger
+        .pair_receive(&session.id, "b", Some("a guess"), 0, false)
+        .is_err());
+
     server.close_pairing(&session.id).unwrap();
-    assert!(joining.pair_receive(&session.id, "b", 0, false).is_err());
+    assert!(joining
+        .pair_receive(&session.id, "b", claim, 0, false)
+        .is_err());
 }
 
 #[test]

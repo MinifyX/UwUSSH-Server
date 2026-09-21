@@ -45,29 +45,68 @@ pub fn verify_signature(public_key: &[u8; 32], material: &[u8], signature: &[u8]
 }
 
 /// What a device was given to sign, and until when.
-type Outstanding = HashMap<Uuid, (Vec<u8>, u64)>;
+type Outstanding = HashMap<Uuid, Vec<(Vec<u8>, u64)>>;
 
-/// One outstanding challenge per device.
+/// Challenges a device may have outstanding at once. More than one, so that
+/// somebody who learned a device id cannot keep it from ever signing in by
+/// asking for a fresh challenge in its name just before it answers.
+pub const CHALLENGES_PER_DEVICE: usize = 4;
+
+/// The challenges devices were given and have not answered yet.
 #[derive(Clone, Default)]
 pub struct Challenges {
     inner: Arc<Mutex<Outstanding>>,
 }
 
 impl Challenges {
-    /// A fresh challenge, replacing whatever that device had before.
+    /// A fresh challenge. The oldest of that device's goes when there are too
+    /// many.
     pub fn issue(&self, device: Uuid) -> Vec<u8> {
         let challenge = random_bytes::<32>().to_vec();
+        let now = now_ms();
         let mut inner = self.inner.lock();
-        inner.retain(|_, (_, expires)| *expires > now_ms());
-        inner.insert(device, (challenge.clone(), now_ms() + CHALLENGE_TTL_MS));
+        inner.retain(|_, issued| {
+            issued.retain(|(_, expires)| *expires > now);
+            !issued.is_empty()
+        });
+        let issued = inner.entry(device).or_default();
+        if issued.len() >= CHALLENGES_PER_DEVICE {
+            issued.remove(0);
+        }
+        issued.push((challenge.clone(), now + CHALLENGE_TTL_MS));
         challenge
     }
 
-    /// Take the challenge back. It is gone either way, so a wrong answer costs
-    /// a round trip rather than giving an attacker another try at the same one.
-    pub fn take(&self, device: Uuid) -> Option<Vec<u8>> {
-        let (challenge, expires) = self.inner.lock().remove(&device)?;
-        (expires > now_ms()).then_some(challenge)
+    /// The challenges a device may answer now.
+    pub fn outstanding(&self, device: Uuid) -> Vec<Vec<u8>> {
+        let now = now_ms();
+        self.inner
+            .lock()
+            .get(&device)
+            .map(|issued| {
+                issued
+                    .iter()
+                    .filter(|(_, expires)| *expires > now)
+                    .map(|(challenge, _)| challenge.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Use one up. Returns whether it was still there — two requests carrying
+    /// the same signature race here, and only one of them may win.
+    pub fn spend(&self, device: Uuid, challenge: &[u8]) -> bool {
+        let mut inner = self.inner.lock();
+        let Some(issued) = inner.get_mut(&device) else {
+            return false;
+        };
+        let before = issued.len();
+        issued.retain(|(held, _)| held.as_slice() != challenge);
+        let spent = issued.len() < before;
+        if issued.is_empty() {
+            inner.remove(&device);
+        }
+        spent
     }
 }
 
@@ -129,34 +168,44 @@ impl Sessions {
 pub struct Authenticated {
     pub account: Account,
     pub device: Device,
+    /// The token itself, for a request that outlives the moment it was
+    /// checked — an event stream asks again whether it is still good.
+    pub token: String,
+}
+
+/// The device behind the bearer token in `headers`, if there is one and it
+/// is still in.
+pub fn authenticate(state: &AppState, headers: &axum::http::HeaderMap) -> Result<Authenticated> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .ok_or(ApiError::Unauthorized)?;
+
+    let session = state.sessions.get(token).ok_or(ApiError::Unauthorized)?;
+    let conn = state.db.lock();
+    let device = devices::get(&conn, session.device_id)?.ok_or(ApiError::Unauthorized)?;
+    if device.revoked || device.account_id != session.account_id {
+        // A token outliving its device would be an hour of access nobody
+        // can take away.
+        drop(conn);
+        state.sessions.drop_device(session.device_id);
+        return Err(ApiError::Unauthorized);
+    }
+    let account = accounts::get(&conn, session.account_id)?.ok_or(ApiError::Unauthorized)?;
+    Ok(Authenticated {
+        account,
+        device,
+        token: token.to_string(),
+    })
 }
 
 impl FromRequestParts<AppState> for Authenticated {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self> {
-        let token = parts
-            .headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .ok_or(ApiError::Unauthorized)?;
-
-        let session = state
-            .sessions
-            .get(token.trim())
-            .ok_or(ApiError::Unauthorized)?;
-        let conn = state.db.lock();
-        let device = devices::get(&conn, session.device_id)?.ok_or(ApiError::Unauthorized)?;
-        if device.revoked || device.account_id != session.account_id {
-            // A token outliving its device would be an hour of access nobody
-            // can take away.
-            drop(conn);
-            state.sessions.drop_device(session.device_id);
-            return Err(ApiError::Unauthorized);
-        }
-        let account = accounts::get(&conn, session.account_id)?.ok_or(ApiError::Unauthorized)?;
-        Ok(Self { account, device })
+        authenticate(state, &parts.headers)
     }
 }
 
@@ -201,18 +250,34 @@ mod tests {
         let challenges = Challenges::default();
         let device = Uuid::now_v7();
         let challenge = challenges.issue(device);
-        assert_eq!(challenges.take(device), Some(challenge));
-        assert_eq!(challenges.take(device), None, "used up");
+        assert_eq!(challenges.outstanding(device), vec![challenge.clone()]);
+        assert!(challenges.spend(device, &challenge));
+        assert!(!challenges.spend(device, &challenge), "used up");
+        assert!(challenges.outstanding(device).is_empty());
     }
 
     #[test]
-    fn asking_again_replaces_the_challenge() {
+    fn asking_again_does_not_take_the_first_one_away() {
         let challenges = Challenges::default();
         let device = Uuid::now_v7();
         let first = challenges.issue(device);
         let second = challenges.issue(device);
         assert_ne!(first, second);
-        assert_eq!(challenges.take(device), Some(second));
+        assert_eq!(challenges.outstanding(device), vec![first.clone(), second]);
+        assert!(challenges.spend(device, &first), "still good to answer");
+    }
+
+    #[test]
+    fn a_device_holds_only_a_few_challenges() {
+        let challenges = Challenges::default();
+        let device = Uuid::now_v7();
+        let oldest = challenges.issue(device);
+        for _ in 0..CHALLENGES_PER_DEVICE {
+            challenges.issue(device);
+        }
+        let outstanding = challenges.outstanding(device);
+        assert_eq!(outstanding.len(), CHALLENGES_PER_DEVICE);
+        assert!(!outstanding.contains(&oldest));
     }
 
     #[test]

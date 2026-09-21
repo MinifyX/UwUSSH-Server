@@ -67,6 +67,16 @@ pub struct Config {
     pub trust_forwarded: bool,
     /// How long a device's session token lives before it signs again.
     pub session_secs: u64,
+    /// Ask GitHub once a day whether there is a newer release, and say so in
+    /// the log. The only connection the server opens on its own.
+    pub update_check: bool,
+    /// The image tag this machine follows (`latest`, `beta`, `edge` or a
+    /// version), which decides what counts as an update.
+    pub channel: Option<String>,
+    /// How many accounts this server takes, whoever asks.
+    pub max_accounts: u64,
+    /// What one account may hold.
+    pub quota: crate::db::records::Quota,
 }
 
 impl Default for Config {
@@ -79,6 +89,10 @@ impl Default for Config {
             tls: TlsMode::Auto,
             trust_forwarded: false,
             session_secs: 60 * 60,
+            update_check: true,
+            channel: None,
+            max_accounts: 100,
+            quota: crate::db::records::Quota::default(),
         }
     }
 }
@@ -109,12 +123,29 @@ impl Config {
                 .ok_or_else(|| format!("UWUSSH_TLS must be auto or off: {tls}"))?;
         }
         if let Some(trust) = var("UWUSSH_TRUST_FORWARDED") {
-            config.trust_forwarded = matches!(trust.as_str(), "1" | "true" | "yes");
+            config.trust_forwarded = switch(&trust)
+                .ok_or_else(|| format!("UWUSSH_TRUST_FORWARDED must be on or off: {trust}"))?;
         }
         if let Some(secs) = var("UWUSSH_SESSION_SECS") {
             config.session_secs = secs
                 .parse()
                 .map_err(|_| format!("UWUSSH_SESSION_SECS is not a number: {secs}"))?;
+        }
+        if let Some(check) = var("UWUSSH_UPDATE_CHECK") {
+            config.update_check = switch(&check)
+                .ok_or_else(|| format!("UWUSSH_UPDATE_CHECK must be on or off: {check}"))?;
+        }
+        config.channel = var("UWUSSH_CHANNEL");
+        if let Some(max) = var("UWUSSH_MAX_ACCOUNTS") {
+            config.max_accounts = number("UWUSSH_MAX_ACCOUNTS", &max)?;
+        }
+        if let Some(records) = var("UWUSSH_ACCOUNT_MAX_RECORDS") {
+            config.quota.records = number("UWUSSH_ACCOUNT_MAX_RECORDS", &records)?;
+        }
+        if let Some(megabytes) = var("UWUSSH_ACCOUNT_MAX_MB") {
+            config.quota.bytes = number("UWUSSH_ACCOUNT_MAX_MB", &megabytes)?
+                .checked_mul(1024 * 1024)
+                .ok_or("UWUSSH_ACCOUNT_MAX_MB is more than any disk")?;
         }
         Ok(config)
     }
@@ -146,6 +177,21 @@ fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
+fn number(name: &str, value: &str) -> Result<u64, String> {
+    value
+        .trim()
+        .parse()
+        .map_err(|_| format!("{name} is not a number: {value}"))
+}
+
+fn switch(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" | "1" | "true" | "yes" => Some(true),
+        "off" | "0" | "false" | "no" => Some(false),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +203,7 @@ mod tests {
         assert_eq!(config.registration, Registration::Invite);
         assert_eq!(config.tls, TlsMode::Auto, "secure without being asked");
         assert!(!config.trust_forwarded, "off unless a proxy is in front");
+        assert!(config.update_check);
         assert_eq!(config.database().file_name().unwrap(), "uwussh.db");
     }
 
@@ -182,6 +229,14 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(proxied.base_url(), "https://uwussh.example.com");
+    }
+
+    #[test]
+    fn a_switch_is_on_or_off_and_nothing_else() {
+        assert_eq!(switch("OFF"), Some(false));
+        assert_eq!(switch("on"), Some(true));
+        assert_eq!(switch("0"), Some(false));
+        assert_eq!(switch("later"), None);
     }
 
     #[test]

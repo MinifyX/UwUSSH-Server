@@ -12,35 +12,55 @@ everything is sealed with a key it never sees.
 One Rust binary. One SQLite file. No account with us, no telemetry, no
 subscription.
 
-## Run it
+## Install
 
-```yaml
-services:
-  uwussh:
-    image: ghcr.io/minifyx/uwussh-server:latest
-    restart: unless-stopped
-    ports: ['8443:8443']
-    volumes: ['./data:/data']
-    environment:
-      UWUSSH_PUBLIC: nas.lan:8443
-      UWUSSH_REGISTRATION: invite
-```
+On a Linux machine — a NAS, a Raspberry Pi, a small VPS, amd64 or arm64:
 
 ```bash
-docker compose up -d && docker compose logs uwussh
+curl -fsSLO https://github.com/MinifyX/UwUSSH-Server/releases/latest/download/install.sh
+sudo bash install.sh
 ```
 
-The first start makes itself a certificate and writes a **setup code** to the
-log — one string carrying the address, the certificate's fingerprint and an
+It installs Docker when it is missing, asks one thing — how your devices reach
+this machine — sets up `/opt/uwussh`, starts the server and shows a **setup
+code**: one string carrying the address, the certificate's fingerprint and an
 invite. Paste it into UwUSSH under Settings → Sync, type your master password
-once, and that device is in. Later ones get another code:
+once, and that device is in. Every other device joins from the first one, with
+three words it shows you.
 
-```bash
-docker compose exec uwussh uwussh-server invite
 ```
+  UwUSSH Server is running (=^･ω･^=)
+
+  Setup code    uwu1_eyJ1IjoiaHR0cHM6Ly8xOTIuMTY4LjEuMjA6ODQ0MyIsImki…
+  Address       https://192.168.1.20:8443
+  Fingerprint   SHA256:ulfTn6S7NU3WLo3YpGCLPYmpbGfwIQbmvTJDOH421Ok
+```
+
+Without questions: `sudo bash install.sh --public nas.lan --yes`. Another code
+for another account: `docker compose exec uwussh uwussh-server invite` in
+`/opt/uwussh`. `--help` lists every flag, and
+[docs/deployment.md](docs/deployment.md) has the whole way: by hand, behind a
+reverse proxy, backups and restoring them, moving to another machine.
 
 Without Docker: `cargo build --release`, then run `uwussh-server`. It needs a
 folder (`UWUSSH_DATA`, `./data` by default) and nothing else.
+
+## Update
+
+```bash
+cd /opt/uwussh && sudo bash update.sh
+```
+
+It takes a newer copy of itself first, then a backup, then the new image — and
+waits for the server's health check. If the new version does not come up, the
+one from before goes back in. `UWUSSH_VERSION` in `.env` says what the
+machine follows: `latest` for stable releases, `beta` for every release,
+`edge` for every commit on `main` that passed CI, or one exact version.
+
+Once a day the server asks GitHub whether there is something newer on that
+channel and says so in its log. It is the only connection it ever opens on its
+own; `UWUSSH_UPDATE_CHECK=off` stops it. Nothing installs itself: a sync
+server that could replace itself from the network would be one more way in.
 
 ## Adding a second device
 
@@ -56,7 +76,9 @@ This server is the post box for that handshake and nothing more. It carries
 opaque messages between the two sides — at most a handful, at most a few
 kilobytes each, for ten minutes — and never learns the code. Somebody who
 guesses a session id still has to guess the code, and SPAKE2 gives them exactly
-one attempt at it.
+one attempt at it. They do not even get to speak: one side is the device that
+opened the session, signed in as itself, and the other holds its side with a
+secret it made up when it first spoke.
 
 Two secrets, and neither is enough on its own: an intercepted code is worth
 nothing without the password, and the password is worth nothing without a
@@ -101,24 +123,40 @@ be told its password was wrong, and would go looking in the wrong place.
 | `UWUSSH_PUBLIC`          | the listen address | How devices reach this server; goes into the setup code           |
 | `UWUSSH_TLS`             | `auto`             | `auto` for its own certificate, `off` when a proxy does the TLS    |
 | `UWUSSH_REGISTRATION`    | `invite`           | `open`, `invite` or `closed`                                      |
-| `UWUSSH_TRUST_FORWARDED` | off                | Believe `X-Forwarded-For` — only behind a proxy that sets it      |
+| `UWUSSH_TRUST_FORWARDED` | `off`              | Believe the last `X-Forwarded-For` address — only behind a proxy  |
 | `UWUSSH_SESSION_SECS`    | `3600`             | How long a device's token lasts before it signs a challenge again |
+| `UWUSSH_UPDATE_CHECK`    | `on`               | Ask GitHub once a day whether there is a newer release            |
+| `UWUSSH_MAX_ACCOUNTS`    | `100`              | How many accounts the server takes, whoever asks                  |
+| `UWUSSH_ACCOUNT_MAX_RECORDS` | `100000`       | What one account may hold, in records…                            |
+| `UWUSSH_ACCOUNT_MAX_MB`  | `256`              | …and in megabytes                                                 |
+
+With Docker these come from `.env` next to `compose.yaml`, which install.sh
+writes; `UWUSSH_BIND` there says where the container is published and
+`UWUSSH_VERSION` which image it runs.
 
 ## The commands
 
 ```
-uwussh-server               serve (the default)
-uwussh-server invite        a code for one new account, good for a week
-uwussh-server fingerprint   what a device pins, to compare by eye
-uwussh-server accounts      what is on this server, and how many devices each has
-uwussh-server devices <id>  the devices of an account
-uwussh-server revoke <id>   shut a device out
-uwussh-server backup        a consistent copy, right now
+uwussh-server                  serve (the default)
+uwussh-server invite           a code for one new account, good for a week
+uwussh-server fingerprint      what a device pins, to compare by eye
+uwussh-server accounts         what is on this server, and how many devices each has
+uwussh-server devices <id>     the devices of an account
+uwussh-server revoke <id>      shut a device out
+uwussh-server backup           a consistent copy, right now
+uwussh-server restore [name]   list the backups, or put one back (server stopped)
+uwussh-server health           the container's health check
+uwussh-server new-key          a new certificate key, when the old one is lost for good
 ```
 
-Backups run by themselves too: one a night, fourteen kept, written with
-`VACUUM INTO` — copying a live SQLite file would give you the database without
-its write-ahead log, which is a backup that looks fine until you need it.
+In Docker: `docker compose exec uwussh uwussh-server <command>`, from
+`/opt/uwussh`.
+
+Backups run by themselves too: one a night, fourteen kept, and one more before
+every update — written with `VACUUM INTO`, because copying a live SQLite file
+gives you the database without its write-ahead log, which is a backup that
+looks fine until you need it. `restore` checks a backup before it trusts it,
+refuses while the server runs, and keeps the database it replaces.
 
 ## The protocol
 
@@ -130,17 +168,19 @@ the same crate the client uses, so a schema change is one edit in one place.
 | -------------------------------------------- | ----------------------------------------------------- |
 | `POST /v1/accounts`                          | Create an account from an invite                      |
 | `POST /v1/session/challenge`, `POST /v1/session` | A device signs a challenge and gets a token        |
-| `GET /v1/vault`, `GET /v1/vault/params`      | The vault header; the parameters a joining device needs |
+| `GET /v1/vault`, `POST /v1/vault/params`     | The vault header; the parameters a joining device needs |
 | `PUT /v1/vault/key`                          | A new master password: rewrap, no record touched      |
 | `GET /v1/records`, `POST /v1/records`        | Pull from a cursor, push with a version               |
 | `GET /v1/events`                             | "There is something new from N" (server-sent events)  |
-| `GET /v1/devices`, `POST /v1/devices/invite`, `POST /v1/devices/enrol`, `DELETE /v1/devices/{id}` | Devices: list, let one in, shut one out |
+| `GET /v1/devices`, `POST /v1/devices/invite`, `POST /v1/devices/enrol`, `POST /v1/devices/{id}/revoke` | Devices: list, let one in, shut one out — another one only with the master password |
 | `POST /v1/pair`, `GET`/`POST`/`DELETE /v1/pair/{id}` | The post box two devices pair through           |
 | `GET /healthz`                               | Alive, and what schema it speaks                      |
 
-Limits it enforces without a key: 500 records per request, 256 KiB per record,
-16 MiB per request, a handful of small messages per pairing — and rate limits
-on every endpoint where guessing or hammering would pay.
+Limits it enforces without a key: 500 records or 8 MiB per request and per
+page, 256 KiB per record, what one account may hold, a handful of small
+messages per pairing, 64 KiB for every other request, two minutes for any of
+them — and rate limits per address where guessing would pay, and per account
+where one account could wear the server down for everybody else.
 
 ## TLS
 
@@ -161,16 +201,33 @@ start — new dates, new names, same fingerprint — and nothing a device pinned
 ever expires out from under it. Only the private key is kept, in
 `tls/key.pem`, readable by nobody else.
 
-Already have a real certificate? Set `UWUSSH_TLS=off`, put Caddy, Traefik or
-nginx in front, and add `UWUSSH_TRUST_FORWARDED=1` so the rate limits count the
-device's address rather than the proxy's.
+That key is also why **moving the server means moving the whole volume**, not
+just the database: a server with a new key is, to every device, a stranger.
+The health check says so too — it only calls the server healthy when the other
+end of its handshake holds the key in `tls/key.pem`.
+
+Already have a real certificate? `sudo bash install.sh --behind-proxy
+https://sync.example.com` sets `UWUSSH_TLS=off`, listens on `127.0.0.1` only,
+and believes the last `X-Forwarded-For` address, which is the one your proxy
+adds — so the rate limits count devices, not the proxy. Caddy and nginx
+examples are in [docs/deployment.md](docs/deployment.md#behind-a-reverse-proxy).
 
 ## Building on it
 
 ```bash
 cargo test            # unit tests, the API over real HTTP, and the real client
 cargo clippy --all-targets -- -D warnings
+docker build -f docker/Dockerfile -t uwussh-server .   # the image, from source
 ```
+
+CI does more than that on every push: it cross-builds the binaries for amd64
+and arm64, packs them into an image, and runs `install.sh` and `update.sh`
+against it on a real Docker — install, check that the setup code, the
+fingerprint and the certificate on the wire agree, stop it (quickly), update
+it, check the key survived, update to a version that never comes up and watch
+the old one come back, restore a backup. Only then is the image scanned and
+pushed. A `v…` tag makes a release of it: see
+[docs/deployment.md](docs/deployment.md#releases).
 
 `tests/api.rs` drives the server the way a device does, by hand: create an
 account, sign a challenge, push, pull, join a second device, revoke it, pair.

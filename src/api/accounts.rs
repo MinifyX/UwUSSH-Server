@@ -14,12 +14,11 @@ use crate::db::{accounts, devices, invites};
 use crate::limits;
 use crate::state::AppState;
 use crate::{ApiError, Result};
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
-use serde::Deserialize;
 
-pub use uwussh_proto::api::CreateAccount;
+pub use uwussh_proto::api::{CreateAccount, VaultParamsRequest};
 
 /// The first device of a new account.
 pub async fn create(
@@ -28,6 +27,8 @@ pub async fn create(
     peer: Peer,
     Json(request): Json<CreateAccount>,
 ) -> Result<Json<Admitted>> {
+    // Counted whether it works or not: with open registration every attempt
+    // works, and a limit that forgives success would be no limit there.
     let who = who(&state, &headers, peer);
     state.limits.check(&who, &limits::ACCOUNTS)?;
 
@@ -40,6 +41,10 @@ pub async fn create(
     let device_key = device_key(&request.device)?;
 
     let conn = state.db.lock();
+    // Before the invite is spent, so a full server does not eat one.
+    if accounts::count(&conn)? as u64 >= state.config.max_accounts {
+        return Err(ApiError::ServerFull);
+    }
     match state.config.registration {
         Registration::Closed => return Err(ApiError::RegistrationClosed),
         Registration::Invite => {
@@ -56,12 +61,13 @@ pub async fn create(
     let device = devices::add(&conn, account.id, &request.device.name, &device_key)?;
     drop(conn);
 
-    state.limits.forgive(&who, &limits::ACCOUNTS);
     let (token, expires_ms) =
         state
             .sessions
             .issue(account.id, device.id, state.config.session_secs * 1000);
-    tracing::info!(account = %account.id, device = %device.id, name = %device.name, "account created");
+    // No device name: that is whatever somebody typed, and the log is read by
+    // people and by install.sh.
+    tracing::info!(account = %account.id, device = %device.id, "account created");
     Ok(Json(Admitted {
         account_id: account.id,
         device_id: device.id,
@@ -80,28 +86,25 @@ pub async fn vault(
     Ok(Json(header))
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ParamsQuery {
-    /// The enrolment token the device is joining with.
-    enrolment: String,
-}
-
 /// What a joining device needs *before* it can prove anything: the salt and
 /// the costs, so it can turn the master password into the key it will prove
 /// with. The wrapped vault key is not in here — that one is the reward for
 /// proving it.
+///
+/// The enrolment token comes in the body. In the address it would sit in the
+/// access log of every proxy in between.
 pub async fn vault_params(
     State(state): State<AppState>,
     headers: HeaderMap,
     peer: Peer,
-    Query(query): Query<ParamsQuery>,
+    Json(request): Json<VaultParamsRequest>,
 ) -> Result<Json<VaultParams>> {
     let who = who(&state, &headers, peer);
     state.limits.check(&who, &limits::ENROL)?;
 
     let conn = state.db.lock();
     let account =
-        invites::peek_enrolment(&conn, &query.enrolment)?.ok_or(ApiError::Unauthorized)?;
+        invites::peek_enrolment(&conn, &request.enrolment)?.ok_or(ApiError::Unauthorized)?;
     let header = accounts::header(&conn, account)?.ok_or(ApiError::Unauthorized)?;
     Ok(Json(header.params()))
 }
@@ -122,10 +125,6 @@ pub async fn change_password(
             "a vault header no device could open".into(),
         ));
     }
-    let conn = state.db.lock();
-    if !accounts::verify(&conn, auth.account.id, &current)? {
-        return Err(ApiError::Unauthorized);
-    }
     if request.vault.vault_id != auth.account.vault_id {
         // Changing the password does not change which vault this is. A header
         // for another vault would orphan every record in the account.
@@ -133,6 +132,8 @@ pub async fn change_password(
             "that header belongs to another vault".into(),
         ));
     }
+    super::prove_password(&state, &auth, &current)?;
+    let conn = state.db.lock();
     accounts::set_header(&conn, auth.account.id, &request.vault, &next)?;
     tracing::info!(account = %auth.account.id, "master password changed");
     Ok(StatusCode::NO_CONTENT)

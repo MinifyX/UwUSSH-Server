@@ -16,8 +16,26 @@ use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 use uwussh_proto::{
     Accepted, EntityKind, Envelope, PullResponse, PushResponse, SyncCursor, MAX_BATCH,
-    MAX_BLOB_BYTES,
+    MAX_BATCH_BYTES, MAX_BLOB_BYTES,
 };
+
+/// What one account may hold. A vault of hosts, keys and snippets is a few
+/// megabytes; this is room for a hundred times that, and still means one
+/// account cannot fill the disk of a machine that others sync to as well.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Quota {
+    pub records: u64,
+    pub bytes: u64,
+}
+
+impl Default for Quota {
+    fn default() -> Self {
+        Self {
+            records: 100_000,
+            bytes: 256 * 1024 * 1024,
+        }
+    }
+}
 
 /// An XChaCha20-Poly1305 nonce, as every envelope carries.
 const NONCE_BYTES: usize = 24;
@@ -70,10 +88,29 @@ pub fn push(
     device: Uuid,
     envelopes: &[Envelope],
 ) -> Result<PushResponse> {
+    push_within(conn, account, device, envelopes, Quota::default())
+}
+
+/// [`push`], held to what the account may hold. A push that would take it
+/// past that is refused whole; one that makes it smaller — a delete, say —
+/// always goes through, even for an account that is over.
+pub fn push_within(
+    conn: &mut Connection,
+    account: &Account,
+    device: Uuid,
+    envelopes: &[Envelope],
+    quota: Quota,
+) -> Result<PushResponse> {
     if envelopes.len() > MAX_BATCH {
         return Err(ApiError::TooLarge(format!(
             "{} records in one request, at most {MAX_BATCH} are allowed",
             envelopes.len()
+        )));
+    }
+    let sealed: usize = envelopes.iter().map(|envelope| envelope.blob.len()).sum();
+    if envelopes.len() > 1 && sealed > MAX_BATCH_BYTES {
+        return Err(ApiError::TooLarge(format!(
+            "{sealed} sealed bytes in one request, at most {MAX_BATCH_BYTES} are allowed"
         )));
     }
     for envelope in envelopes {
@@ -81,30 +118,38 @@ pub fn push(
     }
 
     let tx = conn.transaction()?;
-    let mut seq: i64 = tx.query_row(
-        "SELECT seq FROM accounts WHERE id = ?1",
+    let (mut seq, held_records, held_bytes): (i64, i64, i64) = tx.query_row(
+        "SELECT seq, record_count, record_bytes FROM accounts WHERE id = ?1",
         [account.id.to_string()],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
+    let (mut records, mut bytes) = (held_records, held_bytes);
     let mut response = PushResponse::default();
 
     for envelope in envelopes {
-        let current: Option<i64> = tx
+        let current: Option<(i64, i64)> = tx
             .query_row(
-                "SELECT seq FROM records WHERE account_id = ?1 AND id = ?2",
+                "SELECT seq, length(blob) FROM records WHERE account_id = ?1 AND id = ?2",
                 params![account.id.to_string(), envelope.id.to_string()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
 
         // A record the server does not have is new, whatever the device
         // thought it was based on: there is nothing here to conflict with.
-        if let Some(current) = current {
+        if let Some((current, _)) = current {
             if current as u64 != envelope.base_seq {
                 if let Some(held) = get(&tx, account, envelope.id)? {
                     response.conflicts.push(held);
                 }
                 continue;
+            }
+        }
+        match current {
+            Some((_, before)) => bytes += envelope.blob.len() as i64 - before,
+            None => {
+                records += 1;
+                bytes += envelope.blob.len() as i64;
             }
         }
 
@@ -141,9 +186,19 @@ pub fn push(
         });
     }
 
+    if (records > held_records && records as u64 > quota.records)
+        || (bytes > held_bytes && bytes as u64 > quota.bytes)
+    {
+        // Dropping the transaction takes back everything above.
+        return Err(ApiError::TooLarge(format!(
+            "this account holds as much as this server allows ({} records, {} MiB)",
+            quota.records,
+            quota.bytes / (1024 * 1024)
+        )));
+    }
     tx.execute(
-        "UPDATE accounts SET seq = ?2 WHERE id = ?1",
-        params![account.id.to_string(), seq],
+        "UPDATE accounts SET seq = ?2, record_count = ?3, record_bytes = ?4 WHERE id = ?1",
+        params![account.id.to_string(), seq, records, bytes],
     )?;
     tx.commit()?;
 
@@ -153,6 +208,12 @@ pub fn push(
 
 /// Everything after a cursor, oldest first. `has_more` is honest: a device
 /// that stops at the first page would otherwise believe it had everything.
+///
+/// A page ends at `limit` records or at [`MAX_BATCH_BYTES`] of sealed bytes,
+/// whichever comes first, and always holds one. Rows are read one at a time
+/// and the reading stops there: five hundred records at the largest size
+/// would be 128 MiB in memory for one request, and a few of those at once
+/// take down a small machine.
 pub fn pull(
     conn: &Connection,
     account: &Account,
@@ -168,15 +229,24 @@ pub fn pull(
           LIMIT ?3",
     )?;
     // One more than asked for, to find out whether there is another page.
-    let mut envelopes = stmt
-        .query_map(
-            params![account.id.to_string(), since as i64, limit as i64 + 1],
-            |row| row_to_envelope(account, row),
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    let has_more = envelopes.len() > limit;
-    envelopes.truncate(limit);
+    let rows = stmt.query_map(
+        params![account.id.to_string(), since as i64, limit as i64 + 1],
+        |row| row_to_envelope(account, row),
+    )?;
+    let mut envelopes = Vec::new();
+    let mut bytes = 0;
+    let mut has_more = false;
+    for row in rows {
+        let envelope = row?;
+        if envelopes.len() == limit
+            || (!envelopes.is_empty() && bytes + envelope.blob.len() > MAX_BATCH_BYTES)
+        {
+            has_more = true;
+            break;
+        }
+        bytes += envelope.blob.len();
+        envelopes.push(envelope);
+    }
     let cursor = envelopes
         .last()
         .and_then(|envelope| envelope.seq)
@@ -242,22 +312,146 @@ pub fn purge_tombstones(
     before_ms: u64,
     below_seq: u64,
 ) -> rusqlite::Result<usize> {
-    let removed = conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    let which = params![account.id.to_string(), before_ms as i64, below_seq as i64];
+    let (count, bytes): (i64, i64) = tx.query_row(
+        "SELECT count(*), coalesce(sum(length(blob)), 0) FROM records
+          WHERE account_id = ?1 AND deleted = 1 AND updated_ms < ?2 AND seq <= ?3",
+        which,
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let removed = tx.execute(
         "DELETE FROM records
           WHERE account_id = ?1 AND deleted = 1 AND updated_ms < ?2 AND seq <= ?3",
-        params![account.id.to_string(), before_ms as i64, below_seq as i64],
+        which,
     )?;
+    tx.execute(
+        "UPDATE accounts
+            SET record_count = max(record_count - ?2, 0), record_bytes = max(record_bytes - ?3, 0)
+          WHERE id = ?1",
+        params![account.id.to_string(), count, bytes],
+    )?;
+    tx.commit()?;
     Ok(removed)
 }
 
+/// How many records an account holds, and how many sealed bytes.
+pub fn usage(conn: &Connection, account: &Account) -> rusqlite::Result<(u64, u64)> {
+    conn.query_row(
+        "SELECT record_count, record_bytes FROM accounts WHERE id = ?1",
+        [account.id.to_string()],
+        |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+    )
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::db::{accounts, Db};
     use uwussh_proto::Hlc;
 
     fn account(conn: &Connection) -> Account {
         accounts::create(conn, &accounts::tests::header(), b"key").unwrap()
+    }
+
+    /// One new record, for tests elsewhere that only need the numbers to move.
+    pub(crate) fn push_one(conn: &mut Connection, account: &Account) {
+        push(
+            conn,
+            account,
+            Uuid::now_v7(),
+            &[envelope(account, Uuid::now_v7(), 0)],
+        )
+        .unwrap();
+    }
+
+    fn sized(account: &Account, bytes: usize) -> Envelope {
+        Envelope {
+            blob: vec![9; bytes],
+            ..envelope(account, Uuid::now_v7(), 0)
+        }
+    }
+
+    #[test]
+    fn a_page_stops_at_the_byte_budget_and_says_there_is_more() {
+        let db = Db::open_in_memory().unwrap();
+        let mut conn = db.lock();
+        let account = account(&conn);
+        let device = Uuid::now_v7();
+        // Forty records of 256 KiB: ten MiB, more than one page may carry.
+        for _ in 0..4 {
+            let batch: Vec<Envelope> = (0..10).map(|_| sized(&account, MAX_BLOB_BYTES)).collect();
+            push_within(&mut conn, &account, device, &batch[..5], Quota::default()).unwrap();
+            push_within(&mut conn, &account, device, &batch[5..], Quota::default()).unwrap();
+        }
+
+        let first = pull(&conn, &account, 0, MAX_BATCH).unwrap();
+        let bytes: usize = first.envelopes.iter().map(|env| env.blob.len()).sum();
+        assert!(bytes <= MAX_BATCH_BYTES, "{bytes}");
+        assert_eq!(first.envelopes.len(), MAX_BATCH_BYTES / MAX_BLOB_BYTES);
+        assert!(first.has_more);
+
+        let second = pull(&conn, &account, first.cursor.0, MAX_BATCH).unwrap();
+        assert_eq!(first.envelopes.len() + second.envelopes.len(), 40);
+        assert!(!second.has_more);
+    }
+
+    #[test]
+    fn one_request_carries_at_most_the_byte_budget() {
+        let db = Db::open_in_memory().unwrap();
+        let mut conn = db.lock();
+        let account = account(&conn);
+        let too_much: Vec<Envelope> = (0..MAX_BATCH_BYTES / MAX_BLOB_BYTES + 1)
+            .map(|_| sized(&account, MAX_BLOB_BYTES))
+            .collect();
+        assert!(matches!(
+            push(&mut conn, &account, Uuid::now_v7(), &too_much),
+            Err(ApiError::TooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn a_full_account_takes_nothing_more_but_may_still_shrink() {
+        let db = Db::open_in_memory().unwrap();
+        let mut conn = db.lock();
+        let account = account(&conn);
+        let device = Uuid::now_v7();
+        let quota = Quota {
+            records: 2,
+            bytes: 1024,
+        };
+        let one = sized(&account, 400);
+        let two = sized(&account, 400);
+        push_within(&mut conn, &account, device, &[one.clone(), two], quota).unwrap();
+        assert_eq!(usage(&conn, &account).unwrap(), (2, 800));
+
+        // A third record is one too many, and so is a bigger version of one.
+        let three = sized(&account, 10);
+        assert!(matches!(
+            push_within(&mut conn, &account, device, &[three], quota),
+            Err(ApiError::TooLarge(_))
+        ));
+        let bigger = Envelope {
+            blob: vec![1; 700],
+            base_seq: 1,
+            ..one.clone()
+        };
+        assert!(push_within(&mut conn, &account, device, &[bigger], quota).is_err());
+        assert_eq!(
+            usage(&conn, &account).unwrap(),
+            (2, 800),
+            "nothing of it stayed"
+        );
+
+        // Deleting makes room, even for an account that is full.
+        let deleted = Envelope {
+            blob: vec![1; 16],
+            base_seq: 1,
+            deleted: true,
+            ..one
+        };
+        push_within(&mut conn, &account, device, &[deleted], quota).unwrap();
+        assert_eq!(usage(&conn, &account).unwrap(), (2, 416));
     }
 
     fn envelope(account: &Account, id: Uuid, base_seq: u64) -> Envelope {

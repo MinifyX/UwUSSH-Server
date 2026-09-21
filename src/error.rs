@@ -21,6 +21,13 @@ pub enum ApiError {
     Unauthorized,
     #[error("registration is closed on this server")]
     RegistrationClosed,
+    /// A proof of the master password that did not check out, from a device
+    /// that is signed in. Not 401: that means "sign in again", and a device
+    /// would do exactly that and ask a second time.
+    #[error("that is not the master password")]
+    WrongPassword,
+    #[error("this server has as many accounts as it takes")]
+    ServerFull,
     #[error("no such thing")]
     NotFound,
     #[error("too large: {0}")]
@@ -47,6 +54,8 @@ impl ApiError {
             Self::Invalid(_) => (StatusCode::BAD_REQUEST, "invalid"),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::RegistrationClosed => (StatusCode::FORBIDDEN, "registration-closed"),
+            Self::WrongPassword => (StatusCode::FORBIDDEN, "wrong-password"),
+            Self::ServerFull => (StatusCode::FORBIDDEN, "server-full"),
             Self::NotFound => (StatusCode::NOT_FOUND, "not-found"),
             Self::TooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "too-large"),
             Self::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate-limited"),

@@ -14,7 +14,7 @@ use uuid::Uuid;
 use uwussh_server::api;
 use uwussh_server::config::TlsMode;
 use uwussh_server::db::{accounts, devices, invites, records, Db};
-use uwussh_server::{now_ms, tls, AppState, Config};
+use uwussh_server::{health, now_ms, tls, updates, AppState, Config};
 
 #[derive(Parser)]
 #[command(name = "uwussh-server", version, about = "Sync server for UwUSSH")]
@@ -44,21 +44,77 @@ enum Command {
         #[arg(long)]
         to: Option<PathBuf>,
     },
+    /// Put a backup back. Without a name, list the backups there are. Only
+    /// while the server is stopped:
+    /// `docker compose stop && docker compose run --rm uwussh restore <name>`
+    Restore {
+        /// A file under `backups`, or a path.
+        backup: Option<PathBuf>,
+    },
+    /// Ask the running server whether it is well. The container's health
+    /// check: the image has no shell and no curl, so the server asks itself.
+    Health,
+    /// Make a new certificate key, because the old one is lost for good.
+    /// Every device pinned the old one and has to be set up again.
+    NewKey,
 }
 
 fn main() -> Result<(), String> {
+    use std::io::IsTerminal;
+    // Everything this server writes is its own: the database and its log, the
+    // backups, the certificate key. Nobody else on the machine reads them.
+    #[cfg(unix)]
+    // SAFETY: umask only sets this process's file mode mask; it cannot fail
+    // and touches no memory.
+    unsafe {
+        libc::umask(0o077);
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "uwussh_server=info,tower_http=warn".into()),
         )
+        // The log goes to stderr, so what a command prints on stdout — a
+        // fingerprint, a list of backups — is only that. Colours for a person
+        // at a terminal, none for `docker compose logs` and whatever reads it:
+        // install.sh looks for the setup code there.
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
+    // `ring` rather than the default provider: it needs no C toolchain beyond
+    // a compiler, so this builds the same everywhere.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let cli = Cli::parse();
     let config = Config::from_env()?;
+    let command = cli.command.unwrap_or(Command::Serve);
+    // Asked every half minute, so it touches nothing but the network — not
+    // even the database.
+    if let Command::Health = command {
+        return health::probe(&config);
+    }
+    // Opening the database would be using it, and a restore needs it unused.
+    if let Command::Restore { backup } = command {
+        return restore(&config, backup);
+    }
     let db = Db::open(&config.database()).map_err(|error| format!("database: {error}"))?;
 
-    match cli.command.unwrap_or(Command::Serve) {
+    match command {
+        Command::Health | Command::Restore { .. } => unreachable!("answered above"),
+        Command::NewKey => {
+            if tls::public_key_of(&config.data_dir)
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                return Err("there is a certificate key; this is for when it is gone".into());
+            }
+            let fingerprint =
+                tls::fingerprint_of(&config.data_dir, true).map_err(|error| error.to_string())?;
+            println!("{fingerprint}");
+            println!("A new key. Every device has to be set up again: remove the server in");
+            println!("UwUSSH under Settings → Sync and connect with a new setup code.");
+            Ok(())
+        }
         Command::Serve => serve(db, config),
         Command::Invite => {
             let code = {
@@ -67,9 +123,10 @@ fn main() -> Result<(), String> {
                     .map_err(|error| error.to_string())?
             };
             let fingerprint = match config.tls {
-                TlsMode::Auto => {
-                    Some(tls::fingerprint_of(&config.data_dir).map_err(|error| error.to_string())?)
-                }
+                TlsMode::Auto => Some(
+                    tls::fingerprint_of(&config.data_dir, !has_accounts(&db))
+                        .map_err(|error| error.to_string())?,
+                ),
                 TlsMode::Off => None,
             };
             println!("Invite code: {code}");
@@ -121,6 +178,9 @@ fn main() -> Result<(), String> {
                 .ok_or_else(|| format!("no device {device}"))?;
             let revoked = devices::revoke(&conn, found.account_id, device)
                 .map_err(|error| error.to_string())?;
+            // What it made goes with it, as it does through the API. Its event
+            // stream in the running server notices within half a minute.
+            invites::drop_enrolments_of(&conn, device).map_err(|error| error.to_string())?;
             println!(
                 "{}",
                 if revoked {
@@ -134,8 +194,8 @@ fn main() -> Result<(), String> {
         Command::Fingerprint => {
             match config.tls {
                 TlsMode::Auto => {
-                    let fingerprint =
-                        tls::fingerprint_of(&config.data_dir).map_err(|error| error.to_string())?;
+                    let fingerprint = tls::fingerprint_of(&config.data_dir, !has_accounts(&db))
+                        .map_err(|error| error.to_string())?;
                     println!("{fingerprint}");
                     println!("{}", config.base_url());
                     println!("A device pins this on the first connection, like an SSH host key.");
@@ -147,11 +207,7 @@ fn main() -> Result<(), String> {
             Ok(())
         }
         Command::Backup { to } => {
-            let path = to.unwrap_or_else(|| {
-                config
-                    .backups()
-                    .join(format!("uwussh-{}.db", date(now_ms())))
-            });
+            let path = to.unwrap_or_else(|| backup_path(&config));
             db.backup_to(&path).map_err(|error| error.to_string())?;
             println!("Written to {}", path.display());
             Ok(())
@@ -165,8 +221,12 @@ async fn serve(db: Db, config: Config) -> Result<(), String> {
     // key that cannot be written is a reason not to start at all.
     let identity = match config.tls {
         TlsMode::Auto => Some(
-            tls::load_or_create(&config.data_dir, &tls::names_for(config.public.as_deref()))
-                .map_err(|error| format!("certificate: {error}"))?,
+            tls::load(
+                &config.data_dir,
+                &tls::names_for(config.public.as_deref()),
+                !has_accounts(&db),
+            )
+            .map_err(|error| format!("certificate: {error}"))?,
         ),
         TlsMode::Off => None,
     };
@@ -183,24 +243,25 @@ async fn serve(db: Db, config: Config) -> Result<(), String> {
             invites::create_invite(&conn, invites::INVITE_TTL_MS)
                 .map_err(|error| error.to_string())?
         };
-        tracing::info!("no accounts yet — here is the setup code for the first device:");
-        tracing::info!("    {}", setup_code(&config, &code, fingerprint.as_deref()));
-        tracing::info!("paste it into UwUSSH under Settings → Sync. It is good for a week.");
+        // As a field of its own: install.sh takes the first `setup_code=` in
+        // the log, and nothing a stranger can make the server log looks like
+        // that — this line is written before anybody can connect.
+        tracing::info!(
+            setup_code = %setup_code(&config, &code, fingerprint.as_deref()),
+            "no accounts yet: paste this setup code into UwUSSH under Settings → Sync. It is good for a week"
+        );
     }
 
     let listen = config.listen;
     let url = config.base_url();
     let state = AppState::new(db, config);
     maintenance(state.clone());
+    updates::spawn(state.config.clone());
+    tracing::info!(version = updates::build().version, "UwUSSH Server");
     let app = api::router(state).into_make_service_with_connect_info::<SocketAddr>();
 
     match identity {
         Some(identity) => {
-            // `ring` rather than the default provider: it needs no C toolchain,
-            // so this builds the same everywhere.
-            rustls::crypto::ring::default_provider()
-                .install_default()
-                .map_err(|_| "could not set up TLS".to_string())?;
             let tls = RustlsConfig::from_pem(
                 identity.cert_pem.into_bytes(),
                 identity.key_pem.into_bytes(),
@@ -213,7 +274,7 @@ async fn serve(db: Db, config: Config) -> Result<(), String> {
                 let handle = handle.clone();
                 async move {
                     shutdown().await;
-                    handle.graceful_shutdown(Some(Duration::from_secs(5)));
+                    handle.graceful_shutdown(Some(GRACE));
                 }
             });
             tracing::info!(%listen, %url, fingerprint = %identity.fingerprint, "UwUSSH sync server ready");
@@ -231,15 +292,52 @@ async fn serve(db: Db, config: Config) -> Result<(), String> {
                 %listen, %url,
                 "serving plain HTTP — put a reverse proxy with a certificate in front"
             );
-            axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown())
-                .await
-                .map_err(|error| error.to_string())
+            // An event stream never ends by itself, and a graceful shutdown
+            // waits for every connection — so after the grace period it stops
+            // waiting, as the TLS side does.
+            let stopping = std::sync::Arc::new(tokio::sync::Notify::new());
+            let serving = axum::serve(listener, app).with_graceful_shutdown({
+                let stopping = stopping.clone();
+                async move {
+                    shutdown().await;
+                    stopping.notify_one();
+                }
+            });
+            tokio::select! {
+                served = serving => served.map_err(|error| error.to_string()),
+                _ = async {
+                    stopping.notified().await;
+                    tokio::time::sleep(GRACE).await;
+                } => Ok(()),
+            }
         }
     }
 }
 
+/// How long open connections get to finish once the server is told to stop.
+/// Docker waits ten seconds before it stops asking.
+const GRACE: Duration = Duration::from_secs(5);
+
+/// Ctrl-C at a terminal, SIGTERM from `docker stop`. The second matters more:
+/// a process that is PID 1 in a container and has no handler for it does not
+/// stop at all, and gets killed ten seconds later.
 async fn shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("stopping");
 }
@@ -255,9 +353,7 @@ fn maintenance(state: AppState) {
             let db = state.db.clone();
             let config = state.config.clone();
             let done = tokio::task::spawn_blocking(move || {
-                let path = config
-                    .backups()
-                    .join(format!("uwussh-{}.db", date(now_ms())));
+                let path = backup_path(&config);
                 if let Err(error) = db.backup_to(&path) {
                     tracing::warn!(%error, "backup failed");
                 } else {
@@ -276,11 +372,14 @@ fn maintenance(state: AppState) {
 
 /// Tombstones every device has read and that are older than a season, and
 /// codes that are long expired.
+///
+/// One account at a time, letting go of the database in between: requests
+/// keep being answered while a server with many accounts tidies up.
 fn purge(db: &Db) {
     const NINETY_DAYS_MS: u64 = 90 * 24 * 60 * 60 * 1000;
-    let conn = db.lock();
-    let _ = invites::purge(&conn);
-    let ids: Vec<String> = match conn
+    let _ = invites::purge(&db.lock());
+    let ids: Vec<String> = match db
+        .lock()
         .prepare("SELECT id FROM accounts")
         .and_then(|mut stmt| stmt.query_map([], |row| row.get(0))?.collect())
     {
@@ -294,6 +393,7 @@ fn purge(db: &Db) {
         let Ok(id) = Uuid::parse_str(&id) else {
             continue;
         };
+        let conn = db.lock();
         let Ok(Some(account)) = accounts::get(&conn, id) else {
             continue;
         };
@@ -329,6 +429,66 @@ fn keep_newest(dir: &std::path::Path, keep: usize) {
     }
 }
 
+/// Whether anybody has an account here — and so has pinned this server's key.
+fn has_accounts(db: &Db) -> bool {
+    accounts::count(&db.lock()).map_or(true, |count| count > 0)
+}
+
+/// `uwussh-server restore [name]`.
+fn restore(config: &Config, backup: Option<PathBuf>) -> Result<(), String> {
+    let Some(backup) = backup else {
+        let backups = list_backups(&config.backups());
+        if backups.is_empty() {
+            println!("No backups in {} yet.", config.backups().display());
+        }
+        for (name, bytes) in backups {
+            println!("{name}  {} KiB", bytes.div_ceil(1024));
+        }
+        return Ok(());
+    };
+    // A bare name means one of the backups; anything else is a path.
+    let path = if backup.components().count() == 1 && !backup.exists() {
+        config.backups().join(&backup)
+    } else {
+        backup
+    };
+    let database = config.database();
+    let aside = database.with_file_name(format!("uwussh.db.before-restore-{}", stamp(now_ms())));
+    uwussh_server::db::restore(&path, &database, &aside)?;
+    println!("Restored from {}.", path.display());
+    if aside.exists() {
+        println!("What was there before is kept as {}.", aside.display());
+    }
+    println!("Start the server again: docker compose up -d");
+    Ok(())
+}
+
+/// The backups under `dir`, oldest first, with their sizes.
+fn list_backups(dir: &std::path::Path) -> Vec<(String, u64)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut backups: Vec<(String, u64)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            (name.starts_with("uwussh-") && name.ends_with(".db"))
+                .then(|| (name, entry.metadata().map(|meta| meta.len()).unwrap_or(0)))
+        })
+        .collect();
+    backups.sort();
+    backups
+}
+
+/// Where a backup goes unless told otherwise: `backups/uwussh-<when>.db`, to
+/// the second — the nightly one and one taken before an update can fall on
+/// the same day, and `VACUUM INTO` will not write over a file.
+fn backup_path(config: &Config) -> PathBuf {
+    config
+        .backups()
+        .join(format!("uwussh-{}.db", stamp(now_ms())))
+}
+
 /// One setup code to paste: where the server is, its certificate fingerprint,
 /// and the invite. The fingerprint is the part that matters — the first device
 /// pins it the way an SSH client pins a host key, and passes it on to every
@@ -358,6 +518,18 @@ fn date(ms: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// `YYYY-MM-DD-HHMMSS`, in UTC. Sorts the way it reads.
+fn stamp(ms: u64) -> String {
+    let seconds = (ms / 1000) % 86_400;
+    format!(
+        "{}-{:02}{:02}{:02}",
+        date(ms),
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,6 +539,16 @@ mod tests {
         assert_eq!(date(0), "1970-01-01");
         assert_eq!(date(1_700_000_000_000), "2023-11-14");
         assert_eq!(date(1_789_000_000_000), "2026-09-10");
+    }
+
+    #[test]
+    fn a_stamp_is_the_date_and_the_time() {
+        assert_eq!(stamp(0), "1970-01-01-000000");
+        // 2023-11-14 22:13:20 UTC
+        assert_eq!(stamp(1_700_000_000_000), "2023-11-14-221320");
+        let mut stamps = [stamp(1_700_000_000_000), stamp(1_699_999_999_000)];
+        stamps.sort();
+        assert_eq!(stamps[0], "2023-11-14-221319", "and it sorts by time");
     }
 
     fn decode(code: &str) -> serde_json::Value {
@@ -414,7 +596,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("uwussh-backups-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         for day in 1..=5 {
-            std::fs::write(dir.join(format!("uwussh-2026-09-0{day}.db")), b"x").unwrap();
+            std::fs::write(dir.join(format!("uwussh-2026-09-0{day}-030000.db")), b"x").unwrap();
         }
         std::fs::write(dir.join("notes.txt"), b"x").unwrap();
 
@@ -428,7 +610,11 @@ mod tests {
         left.sort();
         assert_eq!(
             left,
-            vec!["notes.txt", "uwussh-2026-09-04.db", "uwussh-2026-09-05.db"]
+            vec![
+                "notes.txt",
+                "uwussh-2026-09-04-030000.db",
+                "uwussh-2026-09-05-030000.db"
+            ]
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

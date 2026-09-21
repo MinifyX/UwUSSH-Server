@@ -54,13 +54,6 @@ pub async fn login(
     state.limits.check(&who, &limits::SESSION)?;
 
     let signature = b64::decode(&request.signature).ok_or(ApiError::Unauthorized)?;
-    // Taken, not read: a wrong answer costs a new challenge rather than
-    // another try at the same one.
-    let challenge = state
-        .challenges
-        .take(request.device_id)
-        .ok_or(ApiError::Unauthorized)?;
-
     let device = {
         let conn = state.db.lock();
         devices::get(&conn, request.device_id)?
@@ -69,11 +62,23 @@ pub async fn login(
         .filter(|device| !device.revoked)
         .ok_or(ApiError::Unauthorized)?;
 
-    let material = session_material(device.account_id, device.id, &challenge);
-    if !verify_signature(&device.public_key, &material, &signature) {
+    // Whichever of its challenges the device answered. A wrong answer leaves
+    // them where they are — nobody forges an Ed25519 signature by trying
+    // again — so asking in its name cannot keep a device from signing in.
+    let answered = state
+        .challenges
+        .outstanding(device.id)
+        .into_iter()
+        .find(|challenge| {
+            let material = session_material(device.account_id, device.id, challenge);
+            verify_signature(&device.public_key, &material, &signature)
+        });
+    // Spent here and only once: two requests racing with the same signature
+    // find the challenge there for one of them.
+    let Some(_) = answered.filter(|challenge| state.challenges.spend(device.id, challenge)) else {
         tracing::warn!(device = %device.id, "a signature that did not check out");
         return Err(ApiError::Unauthorized);
-    }
+    };
 
     state.limits.forgive(&who, &limits::SESSION);
     let (token, expires_ms) = state.sessions.issue(

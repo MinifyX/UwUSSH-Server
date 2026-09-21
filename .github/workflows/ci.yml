@@ -1,31 +1,354 @@
 name: CI
 
+# Tests, the scripts and the container image on every push that changes code; documentation-only
+# pushes skip it. A `v…` tag also publishes: the image with its tags, and a GitHub release with
+# install.sh, update.sh, compose.yaml and env.example, each with its checksum.
 on:
   push:
     branches: [main]
+    tags: ["v*"]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  IMAGE: ghcr.io/minifyx/uwussh-server
 
 jobs:
-  check:
+  test:
+    name: Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all-targets
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      # Includes tests/client.rs: the real client, from its own repository, against this server.
+      - run: cargo test --all-targets --locked
 
-  image:
+  scripts:
+    name: Scripts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      # The image is the thing people actually run, so a broken Dockerfile
-      # should fail here and not on somebody's NAS.
-      - run: docker build -t uwussh-server:ci .
-      - run: docker run --rm uwussh-server:ci --version
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Everything anybody is told to run with bash, checked before anybody runs it
+        run: |
+          for script in install.sh update.sh; do bash -n "$script"; done
+          shellcheck --severity=warning install.sh update.sh
+
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: A tag matches the version in Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          # Checked before anything is published: a binary that reports another version than its
+          # tag would confuse update.sh's way back and the server's own look for updates.
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$cargo_version" != "$tag_version" ]; then
+            echo "Cargo.toml says $cargo_version but the tag is $tag_version" >&2
+            exit 1
+          fi
+      - name: CHANGELOG.md has a section for it
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: grep -qx "## ${GITHUB_REF_NAME#v}" CHANGELOG.md
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Known vulnerabilities fail the job; "unmaintained" notices only show up in the log.
+      - run: cargo audit --version || cargo install cargo-audit --locked
+      - run: cargo audit
+
+  binaries:
+    name: Binaries
+    needs: [test, scripts]
+    runs-on: ubuntu-latest
+    env:
+      # The server knows its commit and, for a release, checks for newer releases instead of
+      # newer commits.
+      UWUSSH_GIT_SHA: ${{ github.sha }}
+      UWUSSH_RELEASE: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
+      - name: Cross compiler for arm64
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: release
+      - name: Build amd64
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+      - name: Build arm64
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+        run: cargo build --release --locked --target aarch64-unknown-linux-gnu
+      - name: Collect them
+        run: |
+          mkdir -p dist/amd64 dist/arm64
+          cp target/x86_64-unknown-linux-gnu/release/uwussh-server dist/amd64/
+          cp target/aarch64-unknown-linux-gnu/release/uwussh-server dist/arm64/
+          dist/amd64/uwussh-server --version
+          file dist/arm64/uwussh-server | grep -q aarch64
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: binaries
+          path: dist
+          retention-days: 3
+
+  install:
+    name: Install and update
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: binaries
+          path: dist
+      - name: Three versions, only on this machine
+        run: |
+          chmod +x dist/*/uwussh-server
+          # Two of the same build under two version numbers, and one that never comes up.
+          docker build -q -f docker/Dockerfile.release \
+            --label org.opencontainers.image.version=0.0.1 -t "$IMAGE:0.0.1" .
+          docker build -q -f docker/Dockerfile.release \
+            --label org.opencontainers.image.version=0.0.2 -t "$IMAGE:0.0.2" .
+          printf 'FROM %s\nCMD ["no-such-command"]\n' "$IMAGE:0.0.1" |
+            docker build -q --label org.opencontainers.image.version=0.0.3 -t "$IMAGE:0.0.3" -
+      - name: Install
+        run: |
+          sudo bash install.sh --yes --no-pull --from-checkout --version 0.0.1 --public localhost |
+            tee install.log
+          test "$(sudo stat -c %a /opt/uwussh/.env)" = 600
+          sudo grep -qx 'UWUSSH_PUBLIC=localhost:8443' /opt/uwussh/.env
+
+          # What the setup code says is what the server says, and what it serves.
+          code=$(grep -oE 'uwu1_[A-Za-z0-9_-]+' install.log | head -1)
+          body=$(printf '%s' "${code#uwu1_}" | tr '_-' '/+')
+          while [ $(( ${#body} % 4 )) -ne 0 ]; do body="$body="; done
+          setup=$(printf '%s' "$body" | base64 -d)
+          echo "$setup"
+          test "$(jq -r .u <<<"$setup")" = https://localhost:8443
+          pinned=$(jq -r .f <<<"$setup")
+          cd /opt/uwussh
+          shown=$(sudo docker compose exec -T uwussh uwussh-server fingerprint | head -1)
+          test "$pinned" = "$shown"
+          served=$(openssl s_client -connect localhost:8443 </dev/null 2>/dev/null |
+            openssl x509 -pubkey -noout | openssl pkey -pubin -outform der |
+            openssl dgst -sha256 -binary | base64 | tr -d '=')
+          test "$pinned" = "SHA256:$served"
+          curl -skf https://localhost:8443/healthz
+      - name: It stops when it is told to
+        run: |
+          # SIGTERM, not ten seconds of waiting and then SIGKILL.
+          start=$(date +%s)
+          sudo docker stop uwussh
+          test $(( $(date +%s) - start )) -lt 8
+          sudo docker start uwussh
+      - name: Update, keeping the key and making a backup
+        run: |
+          cd /opt/uwussh
+          before=$(sudo docker compose exec -T uwussh uwussh-server fingerprint | head -1)
+          sudo bash update.sh --yes --no-pull --no-self-update --keep-compose --version 0.0.2
+          label='{{index .Config.Labels "org.opencontainers.image.version"}}'
+          test "$(sudo docker inspect uwussh --format "$label")" = 0.0.2
+          test "$(sudo docker inspect uwussh --format '{{.State.Health.Status}}')" = healthy
+          after=$(sudo docker compose exec -T uwussh uwussh-server fingerprint | head -1)
+          test "$before" = "$after"
+          sudo docker compose cp uwussh:/data/backups "$RUNNER_TEMP/backups"
+          sudo ls "$RUNNER_TEMP/backups" | grep -qE '^uwussh-[0-9-]+\.db$'
+      - name: A version that does not come up puts the one before back
+        run: |
+          cd /opt/uwussh
+          if sudo bash update.sh --yes --no-pull --no-self-update --version 0.0.3; then
+            echo "update.sh should have given up on 0.0.3" >&2
+            exit 1
+          fi
+          sudo grep -qx 'UWUSSH_VERSION=0.0.2' .env
+          for _ in $(seq 1 30); do
+            [ "$(sudo docker inspect uwussh --format '{{.State.Health.Status}}')" = healthy ] && break
+            sleep 2
+          done
+          label='{{index .Config.Labels "org.opencontainers.image.version"}}'
+          test "$(sudo docker inspect uwussh --format "$label")" = 0.0.2
+          test "$(sudo docker inspect uwussh --format '{{.State.Health.Status}}')" = healthy
+      - name: A backup goes back, but not under a running server
+        run: |
+          cd /opt/uwussh
+          name=$(sudo docker compose run --rm -T uwussh restore | head -1 | cut -d' ' -f1)
+          echo "restoring $name"
+          if sudo docker compose run --rm -T uwussh restore "$name"; then
+            echo "a restore under a running server should have been refused" >&2
+            exit 1
+          fi
+          sudo docker compose stop
+          sudo docker compose run --rm -T uwussh restore "$name" | tee "$RUNNER_TEMP/restore.log"
+          grep -q 'Restored from' "$RUNNER_TEMP/restore.log"
+          sudo docker compose up -d
+          for _ in $(seq 1 30); do
+            [ "$(sudo docker inspect uwussh --format '{{.State.Health.Status}}')" = healthy ] && break
+            sleep 2
+          done
+          test "$(sudo docker inspect uwussh --format '{{.State.Health.Status}}')" = healthy
+      - name: What the server said
+        if: always()
+        run: cd /opt/uwussh && sudo docker compose logs --no-color || true
+
+  image:
+    name: Container image
+    if: github.event_name != 'pull_request'
+    needs: [test, scripts, audit, install, version]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # This job can push images. Nothing here needs git credentials afterwards, so none are
+          # left lying in .git/config.
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: binaries
+          path: dist
+      - run: chmod +x dist/*/uwussh-server
+      # No QEMU: the only stage that runs anything runs on the machine that builds.
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        id: meta
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=edge,enable={{is_default_branch}}
+            # Every release, stable or not; stable ones also get latest.
+            type=raw,value=beta,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=sha,prefix=sha-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      # The amd64 image into the local daemon first, and scanned, so a known-vulnerable image is
+      # never pushed. The multi-arch push below reuses the same build cache.
+      - name: Build for scanning
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: docker/Dockerfile.release
+          platforms: linux/amd64
+          load: true
+          tags: uwussh-server:scan
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Install Trivy
+        env:
+          VERSION: "0.74.0"
+          SHA256: 2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/trivy.tar.gz" \
+            "https://github.com/aquasecurity/trivy/releases/download/v$VERSION/trivy_${VERSION}_Linux-64bit.tar.gz"
+          echo "$SHA256  $RUNNER_TEMP/trivy.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/trivy.tar.gz" -C "$RUNNER_TEMP" trivy
+      - name: Scan the image
+        run: |
+          # Fail only on vulnerabilities that have a fix available; log the rest.
+          "$RUNNER_TEMP/trivy" image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
+            --exit-code 1 --no-progress uwussh-server:scan
+      - name: Check the image starts, before it goes anywhere
+        run: docker run --rm uwussh-server:scan --version
+      - name: Push the image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: docker/Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Check what was pushed starts too
+        run: docker run --rm "${IMAGE}:sha-${GITHUB_SHA::7}" --version
+
+  release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Package the files people download
+        run: |
+          # install.sh and update.sh check what they fetch, so everything they fetch needs a sum.
+          mkdir -p release
+          cp .env.example release/env.example
+          for file in install.sh update.sh compose.yaml; do cp "$file" release/; done
+          for file in install.sh update.sh compose.yaml env.example; do
+            (cd release && sha256sum "$file" > "$file.sha256")
+          done
+          chmod +x release/install.sh release/update.sh
+      - name: Release notes from CHANGELOG.md
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v heading="## ${version}" '
+            $0 == heading || index($0, heading " ") == 1 { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "CHANGELOG.md has no section for ${version}" >&2
+            exit 1
+          fi
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          flags=""
+          case "$GITHUB_REF_NAME" in *-*) flags="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" $flags --title "UwUSSH Server ${GITHUB_REF_NAME#v}" \
+            --notes-file notes.md \
+            release/install.sh release/install.sh.sha256 \
+            release/update.sh release/update.sh.sha256 \
+            release/compose.yaml release/compose.yaml.sha256 \
+            release/env.example release/env.example.sha256

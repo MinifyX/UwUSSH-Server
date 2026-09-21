@@ -18,7 +18,8 @@
 //! - **Small and few.** A handful of messages, a few kilobytes each. This is a
 //!   handshake, not a file transfer, and nobody gets to use it as one.
 
-use crate::{now_ms, random_bytes, ApiError, Result};
+use crate::db::constant_time_eq;
+use crate::{now_ms, random_bytes, sha256, ApiError, Result};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -39,6 +40,16 @@ pub const MAX_MESSAGE_BYTES: usize = 8 * 1024;
 
 /// How long a device waits for the other side before asking again.
 pub const POLL_SECS: u64 = 20;
+
+/// Sessions one account may have open at once. A person pairs one device at
+/// a time; three leaves room for giving up and starting over.
+pub const OPEN_PER_ACCOUNT: usize = 3;
+
+/// Sessions the whole server holds at once. Each one can hold 64 KiB.
+pub const OPEN_AT_MOST: usize = 1_000;
+
+/// The longest claim side `b` may hold its side with.
+const MAX_CLAIM_BYTES: usize = 128;
 
 /// The alphabet a code is read aloud in: no letters that look like digits.
 const ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTVWXYZ23456789";
@@ -70,6 +81,11 @@ impl Side {
 
 struct Session {
     account: Uuid,
+    /// The device that opened the session, and the only one that speaks as
+    /// side `a`.
+    opener: Uuid,
+    /// A hash of the secret side `b` holds its side with, once it has spoken.
+    claim: Option<[u8; 32]>,
     from_a: Vec<Vec<u8>>,
     from_b: Vec<Vec<u8>>,
     expires_ms: u64,
@@ -103,9 +119,22 @@ impl Pairings {
     /// Open a session and return the short id that names it. The words that go
     /// with it are the client's business: they are the SPAKE2 password, and
     /// this server must never see them.
-    pub fn open(&self, account: Uuid) -> String {
+    pub fn open(&self, account: Uuid, opener: Uuid) -> Result<String> {
         let mut inner = self.inner.lock();
         inner.retain(|_, session| session.expires_ms > now_ms());
+        if inner.len() >= OPEN_AT_MOST {
+            return Err(ApiError::RateLimited);
+        }
+        if inner
+            .values()
+            .filter(|session| session.account == account)
+            .count()
+            >= OPEN_PER_ACCOUNT
+        {
+            return Err(ApiError::Invalid(
+                "this account is pairing three devices already; finish or cancel one first".into(),
+            ));
+        }
         let id = loop {
             let id = code();
             if !inner.contains_key(&id) {
@@ -116,13 +145,48 @@ impl Pairings {
             id.clone(),
             Session {
                 account,
+                opener,
+                claim: None,
                 from_a: Vec::new(),
                 from_b: Vec::new(),
                 expires_ms: now_ms() + TTL_MS,
                 arrived: Arc::new(Notify::new()),
             },
         );
-        id
+        Ok(id)
+    }
+
+    /// Whether whoever asks may speak for `side`: for `a`, only the device
+    /// that opened the session; for `b`, whoever holds the claim — and the
+    /// first claim to arrive is the one that holds it.
+    pub fn admit(
+        &self,
+        id: &str,
+        side: Side,
+        device: Option<Uuid>,
+        claim: Option<&str>,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock();
+        let session = live(&mut inner, id)?;
+        match side {
+            Side::A if device == Some(session.opener) => Ok(()),
+            Side::A => Err(ApiError::Unauthorized),
+            Side::B => {
+                let claim = claim
+                    .map(str::trim)
+                    .filter(|claim| !claim.is_empty() && claim.len() <= MAX_CLAIM_BYTES)
+                    .ok_or(ApiError::Unauthorized)?;
+                let hash = sha256(claim.as_bytes());
+                match session.claim {
+                    None => {
+                        session.claim = Some(hash);
+                        Ok(())
+                    }
+                    Some(held) if constant_time_eq(&held, &hash) => Ok(()),
+                    Some(_) => Err(ApiError::Unauthorized),
+                }
+            }
+        }
     }
 
     /// Put a message in for the other side.
@@ -172,6 +236,14 @@ impl Pairings {
         self.inner.lock().remove(id).is_some()
     }
 
+    /// Every session a device opened, over — for a device that was revoked.
+    pub fn close_opened_by(&self, device: Uuid) -> usize {
+        let mut inner = self.inner.lock();
+        let before = inner.len();
+        inner.retain(|_, session| session.opener != device);
+        before - inner.len()
+    }
+
     pub fn len(&self) -> usize {
         let mut inner = self.inner.lock();
         inner.retain(|_, session| session.expires_ms > now_ms());
@@ -214,7 +286,7 @@ mod tests {
     fn each_side_hears_the_other_and_not_itself() {
         let pairings = Pairings::default();
         let account = Uuid::now_v7();
-        let id = pairings.open(account);
+        let id = pairings.open(account, Uuid::now_v7()).unwrap();
 
         pairings
             .post(&id, Side::A, b"spake from a".to_vec())
@@ -249,7 +321,7 @@ mod tests {
     #[test]
     fn a_session_that_is_over_is_gone() {
         let pairings = Pairings::default();
-        let id = pairings.open(Uuid::now_v7());
+        let id = pairings.open(Uuid::now_v7(), Uuid::now_v7()).unwrap();
         assert!(pairings.close(&id));
         assert!(!pairings.close(&id));
         assert!(matches!(
@@ -275,7 +347,7 @@ mod tests {
     #[test]
     fn a_handshake_cannot_turn_into_a_file_transfer() {
         let pairings = Pairings::default();
-        let id = pairings.open(Uuid::now_v7());
+        let id = pairings.open(Uuid::now_v7(), Uuid::now_v7()).unwrap();
 
         assert!(matches!(
             pairings.post(&id, Side::A, vec![0; MAX_MESSAGE_BYTES + 1]),
@@ -300,8 +372,8 @@ mod tests {
     #[test]
     fn two_sessions_never_get_mixed_up() {
         let pairings = Pairings::default();
-        let one = pairings.open(Uuid::now_v7());
-        let two = pairings.open(Uuid::now_v7());
+        let one = pairings.open(Uuid::now_v7(), Uuid::now_v7()).unwrap();
+        let two = pairings.open(Uuid::now_v7(), Uuid::now_v7()).unwrap();
         assert_ne!(one, two);
 
         pairings.post(&one, Side::A, b"for one".to_vec()).unwrap();
@@ -312,7 +384,7 @@ mod tests {
     #[test]
     fn a_session_runs_out() {
         let pairings = Pairings::default();
-        let id = pairings.open(Uuid::now_v7());
+        let id = pairings.open(Uuid::now_v7(), Uuid::now_v7()).unwrap();
         pairings.inner.lock().get_mut(&id).unwrap().expires_ms = now_ms() - 1;
 
         assert!(matches!(
@@ -325,7 +397,7 @@ mod tests {
     #[tokio::test]
     async fn waiting_ends_as_soon_as_the_other_side_speaks() {
         let pairings = Pairings::default();
-        let id = pairings.open(Uuid::now_v7());
+        let id = pairings.open(Uuid::now_v7(), Uuid::now_v7()).unwrap();
         let waiter = pairings.waiter(&id).unwrap();
 
         let posting = {
@@ -350,5 +422,59 @@ mod tests {
         assert_eq!(one.len(), 5);
         assert!(one.chars().all(|c| ALPHABET.contains(&(c as u8))));
         assert_ne!(one, code());
+    }
+
+    #[test]
+    fn side_a_is_the_device_that_opened_it_and_side_b_whoever_claimed_it_first() {
+        let pairings = Pairings::default();
+        let opener = Uuid::now_v7();
+        let id = pairings.open(Uuid::now_v7(), opener).unwrap();
+
+        assert!(pairings.admit(&id, Side::A, Some(opener), None).is_ok());
+        assert!(matches!(
+            pairings.admit(&id, Side::A, Some(Uuid::now_v7()), None),
+            Err(ApiError::Unauthorized)
+        ));
+        assert!(pairings.admit(&id, Side::A, None, Some("claim")).is_err());
+
+        assert!(
+            pairings.admit(&id, Side::B, None, None).is_err(),
+            "side b without a claim"
+        );
+        assert!(pairings.admit(&id, Side::B, None, Some("mine")).is_ok());
+        assert!(pairings.admit(&id, Side::B, None, Some("mine")).is_ok());
+        assert!(matches!(
+            pairings.admit(&id, Side::B, None, Some("somebody else's")),
+            Err(ApiError::Unauthorized)
+        ));
+        assert!(pairings
+            .admit(&id, Side::B, None, Some(&"x".repeat(500)))
+            .is_err());
+    }
+
+    #[test]
+    fn an_account_pairs_a_few_devices_at_a_time() {
+        let pairings = Pairings::default();
+        let account = Uuid::now_v7();
+        for _ in 0..OPEN_PER_ACCOUNT {
+            pairings.open(account, Uuid::now_v7()).unwrap();
+        }
+        assert!(pairings.open(account, Uuid::now_v7()).is_err());
+        assert!(
+            pairings.open(Uuid::now_v7(), Uuid::now_v7()).is_ok(),
+            "another account"
+        );
+    }
+
+    #[test]
+    fn a_revoked_device_takes_its_sessions_along() {
+        let pairings = Pairings::default();
+        let (gone, stays) = (Uuid::now_v7(), Uuid::now_v7());
+        let account = Uuid::now_v7();
+        let closed = pairings.open(account, gone).unwrap();
+        let open = pairings.open(account, stays).unwrap();
+        assert_eq!(pairings.close_opened_by(gone), 1);
+        assert!(pairings.read(&closed, Side::B, 0).is_err());
+        assert!(pairings.read(&open, Side::B, 0).is_ok());
     }
 }

@@ -17,7 +17,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use uuid::Uuid;
-use uwussh_proto::api::DeviceSummary;
+use uwussh_proto::api::{DeviceSummary, RevokeDevice};
 
 pub async fn list(
     auth: Authenticated,
@@ -33,9 +33,12 @@ pub use uwussh_proto::api::{EnrolDevice as EnrolRequest, EnrolmentToken as Enrol
 /// already in. It travels to the new device through the pairing channel, never
 /// through this server in the clear.
 pub async fn invite(auth: Authenticated, State(state): State<AppState>) -> Result<Json<Enrolment>> {
+    state
+        .limits
+        .check_account(auth.account.id, &limits::JOINS)?;
     let conn = state.db.lock();
-    let token = invites::create_enrolment(&conn, auth.account.id)?;
-    tracing::info!(account = %auth.account.id, "an enrolment token was made");
+    let token = invites::create_enrolment(&conn, auth.account.id, auth.device.id)?;
+    tracing::info!(account = %auth.account.id, device = %auth.device.id, "an enrolment token was made");
     Ok(Json(Enrolment {
         token,
         expires_ms: crate::now_ms() + invites::ENROLMENT_TTL_MS,
@@ -55,12 +58,14 @@ pub async fn enrol(
     let device_key = device_key(&request.device)?;
 
     let conn = state.db.lock();
-    // Look first, spend later: a wrong password must not use up the token the
-    // other device just showed on its screen.
+    // Look first, spend later: a mistyped password must not use up the token
+    // the other device just showed on its screen. But only a few times — a
+    // token is not a licence to guess the password with.
     let account =
         invites::peek_enrolment(&conn, &request.enrolment)?.ok_or(ApiError::Unauthorized)?;
     if !accounts::verify(&conn, account, &key)? {
-        tracing::warn!(%account, "a join with the wrong master password");
+        let spent = invites::enrolment_failed(&conn, &request.enrolment)?;
+        tracing::warn!(%account, spent, "a join with the wrong master password");
         return Err(ApiError::Unauthorized);
     }
     if invites::redeem_enrolment(&conn, &request.enrolment)?.is_none() {
@@ -74,7 +79,7 @@ pub async fn enrol(
         state
             .sessions
             .issue(account, device.id, state.config.session_secs * 1000);
-    tracing::info!(%account, device = %device.id, name = %device.name, "a device joined");
+    tracing::info!(%account, device = %device.id, "a device joined");
     Ok(Json(Admitted {
         account_id: account,
         device_id: device.id,
@@ -83,13 +88,28 @@ pub async fn enrol(
     }))
 }
 
-/// Shut a device out. It stops syncing at once — its tokens go with it — but
+/// Shut a device out. It stops syncing at once — its tokens, its event
+/// streams, the enrolment tokens and pairing sessions it made go with it — but
 /// what it already holds, it holds: the client says so when you do this.
+///
+/// A device may take itself out with its token alone. Any other one takes the
+/// master password as well, proved the way a password change proves it:
+/// whoever holds a stolen laptop has its token, and must not be able to lock
+/// the owner's other devices out one by one.
 pub async fn revoke(
     auth: Authenticated,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Json(request): Json<RevokeDevice>,
 ) -> Result<StatusCode> {
+    if id != auth.device.id {
+        let key = request
+            .current_auth_key
+            .as_deref()
+            .ok_or(ApiError::WrongPassword)?;
+        super::prove_password(&state, &auth, &auth_key(key)?)?;
+    }
+
     let conn = state.db.lock();
     if devices::live_count(&conn, auth.account.id)? <= 1 {
         // An account with no device left is an account nobody can reach, and
@@ -101,9 +121,14 @@ pub async fn revoke(
     if !devices::revoke(&conn, auth.account.id, id)? {
         return Err(ApiError::NotFound);
     }
+    let tokens = invites::drop_enrolments_of(&conn, id)?;
     drop(conn);
 
     state.sessions.drop_device(id);
-    tracing::info!(account = %auth.account.id, device = %id, "device revoked");
+    let pairings = state.pairings.close_opened_by(id);
+    tracing::info!(
+        account = %auth.account.id, device = %id, tokens, pairings,
+        "device revoked"
+    );
     Ok(StatusCode::NO_CONTENT)
 }

@@ -24,15 +24,19 @@ struct Server {
 }
 
 async fn start(registration: Registration) -> Server {
+    start_with(Config {
+        registration,
+        ..Config::default()
+    })
+    .await
+}
+
+async fn start_with(config: Config) -> Server {
     // The client crate brings in a rustls that expects its provider to be
     // chosen, and cargo unifies features across the test binary. Choosing it
     // here is what the server itself does when it serves.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let config = Config {
-        registration,
-        ..Config::default()
-    };
     let state = AppState::new(Db::open_in_memory().unwrap(), config);
     let app = api::router(state.clone());
 
@@ -261,7 +265,8 @@ async fn a_second_device_joins_with_a_token_and_the_master_password() {
     // costs — and gets nothing it could attack offline.
     let params: serde_json::Value = server
         .client
-        .get(server.url(&format!("/v1/vault/params?enrolment={token}")))
+        .post(server.url("/v1/vault/params"))
+        .json(&json!({ "enrolment": token }))
         .send()
         .await
         .unwrap()
@@ -474,14 +479,10 @@ async fn a_revoked_device_is_out_at_once() {
     };
     assert_eq!(second.pull(&server, 0).await.envelopes.len(), 0);
 
-    let revoked = server
-        .client
-        .delete(server.url(&format!("/v1/devices/{}", second.id)))
-        .bearer_auth(&first.token)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(revoked.status(), 204);
+    assert_eq!(
+        revoke(&server, &first, second.id, Some("master")).await,
+        204
+    );
 
     // The token it was holding is worthless from this moment.
     let response = server
@@ -496,14 +497,287 @@ async fn a_revoked_device_is_out_at_once() {
     assert_eq!(second.login(&server).await, 401);
 
     // The last device standing cannot shut itself out: nobody would be left.
-    let refused = server
+    assert_eq!(revoke(&server, &first, first.id, None).await, 400);
+}
+
+/// Revoke `target`, signed in as `by`, with the master password or without.
+async fn revoke(
+    server: &Server,
+    by: &Device,
+    target: Uuid,
+    password: Option<&str>,
+) -> reqwest::StatusCode {
+    let body = match password {
+        Some(password) => json!({ "currentAuthKey": login_key(password) }),
+        None => json!({}),
+    };
+    server
         .client
-        .delete(server.url(&format!("/v1/devices/{}", first.id)))
-        .bearer_auth(&first.token)
+        .post(server.url(&format!("/v1/devices/{target}/revoke")))
+        .bearer_auth(&by.token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+/// An enrolment token made by `by`.
+async fn enrolment_token(server: &Server, by: &Device) -> String {
+    let enrolment: serde_json::Value = server
+        .client
+        .post(server.url("/v1/devices/invite"))
+        .bearer_auth(&by.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    enrolment["token"].as_str().unwrap().to_string()
+}
+
+/// Join `first`'s account as a device with key `seed`.
+async fn join(server: &Server, token: &str, password: &str, seed: u8) -> reqwest::Response {
+    let key = Device::new_key(seed);
+    server
+        .client
+        .post(server.url("/v1/devices/enrol"))
+        .json(&json!({
+            "enrolment": token,
+            "authKey": login_key(password),
+            "device": {
+                "name": format!("device {seed}"),
+                "publicKey": uwussh_server::b64::encode(key.verifying_key().to_bytes()),
+            },
+        }))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn second_device(server: &Server, first: &Device, seed: u8) -> Device {
+    let token = enrolment_token(server, first).await;
+    let response = join(server, &token, "master", seed).await;
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    Device {
+        signing: Device::new_key(seed),
+        account: first.account,
+        id: body["deviceId"].as_str().unwrap().parse().unwrap(),
+        token: body["token"].as_str().unwrap().to_string(),
+        vault_id: first.vault_id,
+    }
+}
+
+#[tokio::test]
+async fn shutting_another_device_out_takes_the_master_password() {
+    let server = start(Registration::Open).await;
+    let first = Device::create_account(&server, "", "master", 1).await;
+    let second = second_device(&server, &first, 2).await;
+    let third = second_device(&server, &first, 3).await;
+
+    // A stolen laptop has its token, and that is all it has.
+    assert_eq!(revoke(&server, &second, first.id, None).await, 403);
+    assert_eq!(
+        revoke(&server, &second, first.id, Some("a guess")).await,
+        403
+    );
+    assert_eq!(
+        first.pull(&server, 0).await.envelopes.len(),
+        0,
+        "and the owner's device is still in"
+    );
+    // Guessing on is slowed down for that laptop alone: it cannot use up the
+    // tries of the owner's devices, and so cannot keep itself from being
+    // revoked.
+    let mut slowed = false;
+    for _ in 0..12 {
+        if revoke(&server, &second, first.id, Some("another guess")).await == 429 {
+            slowed = true;
+            break;
+        }
+    }
+    assert!(slowed, "ten wrong proofs an hour from one device");
+
+    // The owner, with the password, can shut the laptop out.
+    assert_eq!(
+        revoke(&server, &first, second.id, Some("master")).await,
+        204
+    );
+    // And a device may always take itself out.
+    assert_eq!(revoke(&server, &third, third.id, None).await, 204);
+}
+
+#[tokio::test]
+async fn a_revoked_device_takes_its_tokens_and_pairings_along() {
+    let server = start(Registration::Open).await;
+    let first = Device::create_account(&server, "", "master", 1).await;
+    let second = second_device(&server, &first, 2).await;
+
+    // Before it is shut out, it makes a token and opens a pairing.
+    let token = enrolment_token(&server, &second).await;
+    let opened: serde_json::Value = server
+        .client
+        .post(server.url("/v1/pair"))
+        .bearer_auth(&second.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let pairing = opened["id"].as_str().unwrap().to_string();
+
+    assert_eq!(
+        revoke(&server, &first, second.id, Some("master")).await,
+        204
+    );
+
+    assert_eq!(
+        join(&server, &token, "master", 9).await.status(),
+        401,
+        "its token died with it"
+    );
+    let gone = server
+        .client
+        .get(server.url(&format!("/v1/pair/{pairing}?side=b")))
+        .header("x-uwussh-pair-claim", "somebody")
         .send()
         .await
         .unwrap();
-    assert_eq!(refused.status(), 400);
+    assert_eq!(gone.status(), 404, "and so did its pairing");
+}
+
+#[tokio::test]
+async fn an_enrolment_token_is_no_licence_to_guess_the_password() {
+    let server = start(Registration::Open).await;
+    let first = Device::create_account(&server, "", "master", 1).await;
+    let token = enrolment_token(&server, &first).await;
+    // A typo or two is fine...
+    assert_eq!(join(&server, &token, "mastr", 2).await.status(), 401);
+    // ...but five wrong passwords use the token up, the right one included.
+    for _ in 0..4 {
+        assert_eq!(join(&server, &token, "guess", 2).await.status(), 401);
+    }
+    assert_eq!(join(&server, &token, "master", 2).await.status(), 401);
+}
+
+#[tokio::test]
+async fn open_registration_counts_every_account_it_makes() {
+    let server = start(Registration::Open).await;
+    for seed in 0..5 {
+        Device::create_account(&server, "", "master", seed).await;
+    }
+    let response = server
+        .client
+        .post(server.url("/v1/accounts"))
+        .json(&json!({
+            "invite": "",
+            "vault": Server::vault(Uuid::now_v7()),
+            "authKey": login_key("master"),
+            "device": { "name": "x", "publicKey": uwussh_server::b64::encode([7u8; 32]) },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        429,
+        "five an hour from one address, not more"
+    );
+}
+
+#[tokio::test]
+async fn a_full_server_takes_no_more_accounts_and_keeps_the_invite() {
+    let server = start_with(Config {
+        registration: Registration::Invite,
+        max_accounts: 1,
+        ..Config::default()
+    })
+    .await;
+    let first = server.invite().await;
+    Device::create_account(&server, &first, "master", 1).await;
+
+    let second = server.invite().await;
+    let response = server
+        .client
+        .post(server.url("/v1/accounts"))
+        .json(&json!({
+            "invite": second,
+            "vault": Server::vault(Uuid::now_v7()),
+            "authKey": login_key("master"),
+            "device": { "name": "x", "publicKey": uwussh_server::b64::encode([8u8; 32]) },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"], "server-full");
+    let open = uwussh_server::db::invites::count_open_invites(&server.state.db.lock()).unwrap();
+    assert_eq!(open, 1, "the invite was not spent on a refusal");
+}
+
+#[tokio::test]
+async fn a_push_of_several_mebibytes_gets_through() {
+    // The records are the one endpoint that takes more than a few kilobytes,
+    // and the limit it has is the one it says, not a framework's default.
+    let server = start(Registration::Open).await;
+    let device = Device::create_account(&server, "", "master", 1).await;
+    let big = vec![3u8; uwussh_proto::MAX_BLOB_BYTES];
+    let batch: Vec<Envelope> = (0..12)
+        .map(|_| device.envelope(Uuid::now_v7(), 0, &big))
+        .collect();
+    let pushed = device.push(&server, &batch).await;
+    assert_eq!(pushed.accepted.len(), 12);
+
+    // Everything else stays small.
+    let response = server
+        .client
+        .post(server.url("/v1/session/challenge"))
+        .header("content-type", "application/json")
+        .body(format!(
+            "{{\"deviceId\":\"{}\",\"pad\":\"{}\"}}",
+            device.id,
+            "x".repeat(100 * 1024)
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 413);
+}
+
+#[tokio::test]
+async fn an_account_holds_what_the_server_allows_and_no_more() {
+    let server = start_with(Config {
+        registration: Registration::Open,
+        quota: uwussh_server::db::records::Quota {
+            records: 3,
+            bytes: 1024 * 1024,
+        },
+        ..Config::default()
+    })
+    .await;
+    let device = Device::create_account(&server, "", "master", 1).await;
+    let three: Vec<Envelope> = (0..3)
+        .map(|_| device.envelope(Uuid::now_v7(), 0, b"a host"))
+        .collect();
+    device.push(&server, &three).await;
+
+    let response = server
+        .client
+        .post(server.url("/v1/records"))
+        .bearer_auth(&device.token)
+        .json(&json!({
+            "schema": SCHEMA_VERSION,
+            "envelopes": [device.envelope(Uuid::now_v7(), 0, b"one more")],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 413);
+    assert_eq!(device.pull(&server, 0).await.envelopes.len(), 3);
 }
 
 #[tokio::test]
@@ -629,7 +903,7 @@ async fn changing_the_master_password_takes_the_old_one() {
             .await
             .unwrap()
             .status(),
-        401
+        403
     );
     assert_eq!(
         change("master", "new", Uuid::now_v7())
@@ -779,18 +1053,30 @@ async fn two_devices_hand_a_secret_through_the_relay() {
     let id = opened["id"].as_str().unwrap().to_string();
     assert_eq!(id.len(), 5, "a code somebody reads out loud");
 
+    // Side a is the device that opened it, signed in; side b has no account
+    // yet and holds its side with a secret it made up.
+    let speaking_as = |side: &str, request: reqwest::RequestBuilder| match side {
+        "a" => request.bearer_auth(&first.token),
+        _ => request.header("x-uwussh-pair-claim", "the joining device's secret"),
+    };
     let post = |side: &'static str, message: &'static [u8]| {
-        server
-            .client
-            .post(server.url(&format!("/v1/pair/{id}")))
-            .json(&json!({ "side": side, "message": uwussh_server::b64::encode(message) }))
-            .send()
+        speaking_as(
+            side,
+            server
+                .client
+                .post(server.url(&format!("/v1/pair/{id}")))
+                .json(&json!({ "side": side, "message": uwussh_server::b64::encode(message) })),
+        )
+        .send()
     };
     let read = |side: &'static str, after: usize| {
-        server
-            .client
-            .get(server.url(&format!("/v1/pair/{id}?side={side}&after={after}")))
-            .send()
+        speaking_as(
+            side,
+            server
+                .client
+                .get(server.url(&format!("/v1/pair/{id}?side={side}&after={after}"))),
+        )
+        .send()
     };
 
     // The handshake: one message each way, then the sealed payload.
@@ -821,6 +1107,24 @@ async fn two_devices_hand_a_secret_through_the_relay() {
         uwussh_server::b64::encode(b"sealed account key"),
         "and only what it has not seen yet"
     );
+
+    // Somebody who only knows the id speaks for neither side.
+    let as_a = server
+        .client
+        .post(server.url(&format!("/v1/pair/{id}")))
+        .json(&json!({ "side": "a", "message": uwussh_server::b64::encode(b"me too") }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(as_a.status(), 401, "side a without the opener's token");
+    let as_b = server
+        .client
+        .get(server.url(&format!("/v1/pair/{id}?side=b&after=0")))
+        .header("x-uwussh-pair-claim", "a different secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(as_b.status(), 401, "side b is taken");
 
     // Finished: the device that opened it says so.
     let closed = server
@@ -853,12 +1157,14 @@ async fn a_waiting_device_is_woken_when_the_other_speaks() {
     let waiting = server
         .client
         .get(server.url(&format!("/v1/pair/{id}?side=b&after=0&wait=true")))
+        .header("x-uwussh-pair-claim", "waiting")
         .send();
     let speaking = async {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         server
             .client
             .post(server.url(&format!("/v1/pair/{id}")))
+            .bearer_auth(&first.token)
             .json(&json!({ "side": "a", "message": uwussh_server::b64::encode(b"at last") }))
             .send()
             .await
@@ -901,6 +1207,7 @@ async fn the_relay_is_a_handshake_and_not_storage() {
         server
             .client
             .post(server.url(&format!("/v1/pair/{id}")))
+            .bearer_auth(&first.token)
             .json(&json!({ "side": "a", "message": message }))
             .send()
     };
@@ -998,6 +1305,7 @@ async fn a_session_nobody_opened_is_not_there_and_not_everyones_to_close() {
         server
             .client
             .get(server.url(&format!("/v1/pair/{id}?side=b")))
+            .header("x-uwussh-pair-claim", "the joining device")
             .send()
             .await
             .unwrap()

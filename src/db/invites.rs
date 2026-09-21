@@ -46,6 +46,12 @@ fn hash(code: &str) -> Vec<u8> {
 pub const INVITE_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 pub const ENROLMENT_TTL_MS: u64 = 10 * 60 * 1000;
 
+/// Wrong master passwords one enrolment token survives. The token is 256
+/// bits, so this is not about guessing it — it is about whoever holds one
+/// guessing the password with it, which is exactly what it must not be good
+/// for. The person who really is joining mistypes twice, not five times.
+pub const ENROLMENT_ATTEMPTS: i64 = 5;
+
 /// Make an invite. The code is returned once and never stored.
 pub fn create_invite(conn: &Connection, ttl_ms: u64) -> rusqlite::Result<String> {
     let code = code();
@@ -76,20 +82,51 @@ pub fn count_open_invites(conn: &Connection) -> rusqlite::Result<i64> {
     )
 }
 
-/// A one-time token for a device joining an account that already exists.
-pub fn create_enrolment(conn: &Connection, account_id: Uuid) -> rusqlite::Result<String> {
+/// A one-time token for a device joining an account that already exists,
+/// made by `device` — which it dies with, should that device be revoked
+/// before the token is used.
+pub fn create_enrolment(
+    conn: &Connection,
+    account_id: Uuid,
+    device: Uuid,
+) -> rusqlite::Result<String> {
     let token = crate::b64::encode(random_bytes::<32>());
     conn.execute(
-        "INSERT INTO enrolments (token_hash, account_id, created_ms, expires_ms)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO enrolments (token_hash, account_id, created_ms, expires_ms, device_id)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             sha256(token.as_bytes()).to_vec(),
             account_id.to_string(),
             now_ms() as i64,
             (now_ms() + ENROLMENT_TTL_MS) as i64,
+            device.to_string(),
         ],
     )?;
     Ok(token)
+}
+
+/// A wrong master password was tried with this token. Returns whether that
+/// used it up.
+pub fn enrolment_failed(conn: &Connection, token: &str) -> rusqlite::Result<bool> {
+    let hash = sha256(token.as_bytes()).to_vec();
+    conn.execute(
+        "UPDATE enrolments SET failures = failures + 1 WHERE token_hash = ?1 AND used_ms IS NULL",
+        [&hash],
+    )?;
+    let spent = conn.execute(
+        "UPDATE enrolments SET used_ms = ?2
+          WHERE token_hash = ?1 AND used_ms IS NULL AND failures >= ?3",
+        params![hash, now_ms() as i64, ENROLMENT_ATTEMPTS],
+    )?;
+    Ok(spent > 0)
+}
+
+/// The unused tokens a device made, gone with it.
+pub fn drop_enrolments_of(conn: &Connection, device: Uuid) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM enrolments WHERE device_id = ?1 AND used_ms IS NULL",
+        [device.to_string()],
+    )
 }
 
 /// Which account a token joins, without using it up: the joining device needs
@@ -183,11 +220,41 @@ mod tests {
     }
 
     #[test]
+    fn a_token_tried_with_too_many_wrong_passwords_is_spent() {
+        let db = Db::open_in_memory().unwrap();
+        let conn = db.lock();
+        let account = accounts::create(&conn, &accounts::tests::header(), b"key").unwrap();
+        let token = create_enrolment(&conn, account.id, Uuid::now_v7()).unwrap();
+        for _ in 1..ENROLMENT_ATTEMPTS {
+            assert!(!enrolment_failed(&conn, &token).unwrap());
+        }
+        assert_eq!(peek_enrolment(&conn, &token).unwrap(), Some(account.id));
+        assert!(
+            enrolment_failed(&conn, &token).unwrap(),
+            "that was the last"
+        );
+        assert_eq!(peek_enrolment(&conn, &token).unwrap(), None);
+    }
+
+    #[test]
+    fn a_device_takes_its_unused_tokens_along() {
+        let db = Db::open_in_memory().unwrap();
+        let conn = db.lock();
+        let account = accounts::create(&conn, &accounts::tests::header(), b"key").unwrap();
+        let (mine, other) = (Uuid::now_v7(), Uuid::now_v7());
+        let gone = create_enrolment(&conn, account.id, mine).unwrap();
+        let kept = create_enrolment(&conn, account.id, other).unwrap();
+        assert_eq!(drop_enrolments_of(&conn, mine).unwrap(), 1);
+        assert_eq!(peek_enrolment(&conn, &gone).unwrap(), None);
+        assert_eq!(peek_enrolment(&conn, &kept).unwrap(), Some(account.id));
+    }
+
+    #[test]
     fn an_enrolment_token_names_its_account_and_is_spent_on_use() {
         let db = Db::open_in_memory().unwrap();
         let conn = db.lock();
         let account = accounts::create(&conn, &accounts::tests::header(), b"key").unwrap();
-        let token = create_enrolment(&conn, account.id).unwrap();
+        let token = create_enrolment(&conn, account.id, Uuid::now_v7()).unwrap();
 
         assert_eq!(peek_enrolment(&conn, &token).unwrap(), Some(account.id));
         assert_eq!(

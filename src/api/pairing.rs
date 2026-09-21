@@ -4,9 +4,16 @@
 //! the two sides agree on, and never sees what they send through it — which is
 //! the whole point: what travels here is the account key, and the account key
 //! is what makes a copy of this server's database worthless.
+//!
+//! It does make sure each side is who it says. Side `a` is the device that
+//! opened the session, signed in as itself. Side `b` has no account yet, so it
+//! makes up a secret and sends it along with every request; the first one to
+//! arrive holds the side. Somebody who guessed a session id can then neither
+//! post as the joining device nor read in its place — SPAKE2 already made that
+//! worthless, this makes it impossible to spoil a pairing that way as well.
 
 use super::{who, Peer};
-use crate::auth::Authenticated;
+use crate::auth::{authenticate, Authenticated};
 use crate::limits;
 use crate::pairing::{self, Side};
 use crate::state::AppState;
@@ -16,6 +23,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Deserialize;
 use std::time::Duration;
+use uwussh_proto::api::PAIR_CLAIM_HEADER;
 
 pub use uwussh_proto::api::{
     PairMessage as PostMessage, PairMessages as Messages, PairOpened as Opened,
@@ -23,7 +31,10 @@ pub use uwussh_proto::api::{
 
 /// A device that is already in opens the session.
 pub async fn open(auth: Authenticated, State(state): State<AppState>) -> Result<Json<Opened>> {
-    let id = state.pairings.open(auth.account.id);
+    state
+        .limits
+        .check_account(auth.account.id, &limits::JOINS)?;
+    let id = state.pairings.open(auth.account.id, auth.device.id)?;
     tracing::info!(account = %auth.account.id, "a pairing session was opened");
     Ok(Json(Opened {
         id,
@@ -31,9 +42,23 @@ pub async fn open(auth: Authenticated, State(state): State<AppState>) -> Result<
     }))
 }
 
-/// Leave a message for the other side. Not authenticated: the device that is
-/// joining has no account yet, and what protects this is the handshake, not a
-/// token.
+/// Whether this request may speak for `side` of session `id`.
+fn admit(state: &AppState, headers: &HeaderMap, id: &str, side: Side) -> Result<()> {
+    match side {
+        Side::A => {
+            let device = authenticate(state, headers)?.device.id;
+            state.pairings.admit(id, side, Some(device), None)
+        }
+        Side::B => {
+            let claim = headers
+                .get(PAIR_CLAIM_HEADER)
+                .and_then(|value| value.to_str().ok());
+            state.pairings.admit(id, side, None, claim)
+        }
+    }
+}
+
+/// Leave a message for the other side.
 pub async fn post(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -45,6 +70,7 @@ pub async fn post(
     state.limits.check(&who, &limits::PAIR)?;
 
     let side = Side::parse(&request.side).ok_or_else(|| ApiError::Invalid("a side".into()))?;
+    admit(&state, &headers, &id, side)?;
     let message =
         b64::decode(&request.message).ok_or_else(|| ApiError::Invalid("a message".into()))?;
     state.pairings.post(&id, side, message)?;
@@ -77,14 +103,20 @@ pub async fn read(
     state.limits.check(&who, &limits::PAIR)?;
 
     let side = Side::parse(&query.side).ok_or_else(|| ApiError::Invalid("a side".into()))?;
-    let mut messages = state.pairings.read(&id, side, query.after)?;
+    admit(&state, &headers, &id, side)?;
 
+    // Listening starts before looking: a message that arrives between the two
+    // would otherwise wake nobody, and cost the other device a whole wait.
+    let waiter = state.pairings.waiter(&id)?;
+    let arrived = waiter.notified();
+    tokio::pin!(arrived);
+    arrived.as_mut().enable();
+
+    let mut messages = state.pairings.read(&id, side, query.after)?;
     if messages.is_empty() && query.wait {
-        let waiter = state.pairings.waiter(&id)?;
         // A timeout is not a failure: the device asks again, and a session
         // that ended in the meantime answers "not found" then.
-        let _ =
-            tokio::time::timeout(Duration::from_secs(pairing::POLL_SECS), waiter.notified()).await;
+        let _ = tokio::time::timeout(Duration::from_secs(pairing::POLL_SECS), arrived).await;
         messages = state.pairings.read(&id, side, query.after)?;
     }
 

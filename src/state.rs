@@ -7,7 +7,7 @@ use crate::pairing::Pairings;
 use crate::Config;
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -45,6 +45,30 @@ impl AppState {
 #[derive(Clone, Default)]
 pub struct Events {
     channels: Arc<Mutex<HashMap<Uuid, broadcast::Sender<u64>>>>,
+    /// Open event streams per device.
+    streams: Arc<Mutex<HashMap<Uuid, usize>>>,
+}
+
+/// Event streams one device may hold open. The app needs one; a few more
+/// cover a restart that has not noticed the old one closing yet.
+pub const MAX_STREAMS_PER_DEVICE: usize = 4;
+
+/// An open event stream, counted until it is dropped.
+pub struct StreamGuard {
+    streams: Arc<Mutex<HashMap<Uuid, usize>>>,
+    device: Uuid,
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        let mut streams = self.streams.lock();
+        if let Some(open) = streams.get_mut(&self.device) {
+            *open -= 1;
+            if *open == 0 {
+                streams.remove(&self.device);
+            }
+        }
+    }
 }
 
 impl Events {
@@ -70,6 +94,20 @@ impl Events {
         }
     }
 
+    /// Room for one more stream for this device, or none.
+    pub fn open_stream(&self, device: Uuid) -> Option<StreamGuard> {
+        let mut streams = self.streams.lock();
+        let open = streams.entry(device).or_default();
+        if *open >= MAX_STREAMS_PER_DEVICE {
+            return None;
+        }
+        *open += 1;
+        Some(StreamGuard {
+            streams: self.streams.clone(),
+            device,
+        })
+    }
+
     pub fn listeners(&self, account: Uuid) -> usize {
         self.channels
             .lock()
@@ -84,24 +122,51 @@ impl Events {
 /// Behind a reverse proxy every request comes from the proxy, so the real
 /// address is in `X-Forwarded-For` — which anyone can set, so it is only
 /// believed when the server was told there is a proxy in front.
+///
+/// Addresses are counted the way they can be had: IPv6 per /64, because one
+/// machine commonly has a whole /64 to itself and can take a fresh address
+/// from it for every request.
+///
+/// And a forwarded address is believed only as its **last** entry: that is the one the proxy added. A
+/// proxy that appends (nginx with `$proxy_add_x_forwarded_for`, most of them)
+/// keeps whatever the client wrote in front of it, so the first address is the
+/// client's to choose — and a rate limit keyed on it is no limit at all.
+/// Anything that is not an address falls back to the socket's.
 pub fn client_key(
     config: &Config,
     headers: &axum::http::HeaderMap,
     peer: Option<SocketAddr>,
 ) -> String {
     if config.trust_forwarded {
-        if let Some(forwarded) = headers
-            .get("x-forwarded-for")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(',').next())
+        // Every line of the header, in order: a proxy may add its own line
+        // instead of appending to the client's.
+        let last = headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
             .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            return forwarded.to_string();
+            .rfind(|value| !value.is_empty())
+            .and_then(|value| value.parse::<std::net::IpAddr>().ok());
+        if let Some(address) = last {
+            return counted(address);
         }
     }
-    peer.map(|peer| peer.ip().to_string())
+    peer.map(|peer| counted(peer.ip()))
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn counted(address: IpAddr) -> String {
+    match address {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let s = v6.segments();
+                format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+            }
+        },
+    }
 }
 
 #[cfg(test)]
@@ -131,14 +196,59 @@ mod tests {
         };
         assert_eq!(client_key(&trusting, &headers("1.2.3.4"), peer), "1.2.3.4");
         assert_eq!(
-            client_key(&trusting, &headers("1.2.3.4, 10.0.0.1"), peer),
+            client_key(&trusting, &headers("6.6.6.6, 1.2.3.4"), peer),
             "1.2.3.4",
-            "the first one is the client"
+            "the last one is what the proxy saw; the first is whatever the client wrote"
+        );
+        let mut two_lines = headers("6.6.6.6");
+        two_lines.append("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        assert_eq!(
+            client_key(&trusting, &two_lines, peer),
+            "1.2.3.4",
+            "a proxy that adds a line of its own"
+        );
+        assert_eq!(
+            client_key(&trusting, &headers("not-an-address"), peer),
+            "10.0.0.5",
+            "and nonsense counts as the socket"
         );
         assert_eq!(
             client_key(&trusting, &HeaderMap::new(), peer),
             "10.0.0.5",
             "and without the header, the socket"
+        );
+    }
+
+    #[test]
+    fn an_ipv6_machine_is_counted_once_for_its_whole_network() {
+        let config = Config::default();
+        let one = Some("[2001:db8:1:2::1]:4000".parse().unwrap());
+        let other = Some("[2001:db8:1:2:ffff::9]:4000".parse().unwrap());
+        let elsewhere = Some("[2001:db8:1:3::1]:4000".parse().unwrap());
+        let key = client_key(&config, &HeaderMap::new(), one);
+        assert_eq!(key, "2001:db8:1:2::/64");
+        assert_eq!(client_key(&config, &HeaderMap::new(), other), key);
+        assert_ne!(client_key(&config, &HeaderMap::new(), elsewhere), key);
+        let mapped = Some("[::ffff:10.0.0.5]:4000".parse().unwrap());
+        assert_eq!(client_key(&config, &HeaderMap::new(), mapped), "10.0.0.5");
+    }
+
+    #[test]
+    fn a_device_holds_only_a_few_streams_open() {
+        let events = Events::default();
+        let device = Uuid::now_v7();
+        let open: Vec<_> = (0..MAX_STREAMS_PER_DEVICE)
+            .map(|_| events.open_stream(device).expect("room"))
+            .collect();
+        assert!(events.open_stream(device).is_none());
+        assert!(
+            events.open_stream(Uuid::now_v7()).is_some(),
+            "another device"
+        );
+        drop(open);
+        assert!(
+            events.open_stream(device).is_some(),
+            "closed ones make room"
         );
     }
 

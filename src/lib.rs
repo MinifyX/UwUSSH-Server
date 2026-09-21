@@ -19,10 +19,12 @@ pub mod auth;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod health;
 pub mod limits;
 pub mod pairing;
 pub mod state;
 pub mod tls;
+pub mod updates;
 
 pub use config::Config;
 pub use error::{ApiError, Result};
