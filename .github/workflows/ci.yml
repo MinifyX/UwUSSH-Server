@@ -151,6 +151,11 @@ jobs:
             docker build -q --label org.opencontainers.image.version=0.0.3 -t "$IMAGE:0.0.3" -
       - name: Install
         run: |
+          # On a server /opt is root's alone; on the runner anybody may write
+          # there, which update.sh rightly refuses to trust.
+          ls -ld /opt
+          sudo chown root:root /opt
+          sudo chmod 755 /opt
           sudo bash install.sh --yes --no-pull --from-checkout --version 0.0.1 --public localhost |
             tee install.log
           test "$(sudo stat -c %a /opt/uwussh/.env)" = 600
