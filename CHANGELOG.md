@@ -3,7 +3,7 @@
 Each release gets a section here before its tag is pushed; CI copies the section into the GitHub
 release. Versions follow semver; `-beta.N` versions are pre-releases.
 
-## Unreleased
+## 0.2.0
 
 **UwUSSH Server is UwUSync Server now.** It syncs UwURDP as well as UwUSSH, so the old name had
 become too narrow. The new names:
