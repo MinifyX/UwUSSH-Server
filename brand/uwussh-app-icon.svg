@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="UwUSSH app icon: Nyu as a terminal window with cat ears">
+  <title>UwUSSH</title>
+  <!--
+    The website and GitHub icon, built like UwUMail's: Nyu slightly tilted on
+    UwUMail's pastel pink tile (#FFF3F8 to #FFD3E5, the same for every UwU
+    app), with sparkles and a heart arranged differently for each app.
+    The dark screen with the UwU face and a >_ prompt says terminal.
+    Here: a big star top left, a small one top right, the heart bottom left.
+  -->
+  <defs>
+    <linearGradient id="uwu-bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFF3F8"/>
+      <stop offset="1" stop-color="#FFD3E5"/>
+    </linearGradient>
+    <filter id="uwu-shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="10" stdDeviation="10" flood-color="#C2306F" flood-opacity="0.25"/>
+    </filter>
+  </defs>
+  <rect width="512" height="512" rx="116" fill="url(#uwu-bg)"/>
+  <g transform="translate(256 290) rotate(-8) scale(0.9) translate(-256 -265)">
+    <g filter="url(#uwu-shadow)"><g stroke-linecap="round" stroke-linejoin="round">
+    <g fill="#FFFFFF" stroke="#FFFFFF" stroke-width="44">
+      <path d="M118 200 L132 100 Q135 82 151 91 L230 156 Z"/>
+      <path d="M394 200 L380 100 Q377 82 361 91 L282 156 Z"/>
+      <rect x="100" y="152" width="312" height="226" rx="50"/>
+    </g>
+    <g fill="#FF6FA6" stroke="#4B1D3F" stroke-width="14">
+      <path d="M118 200 L132 100 Q135 82 151 91 L230 156 Z"/>
+      <path d="M394 200 L380 100 Q377 82 361 91 L282 156 Z"/>
+    </g>
+    <g fill="#FFB8D3">
+      <path d="M148 150 L152 118 Q153 110 160 114 L194 143 Z"/>
+      <path d="M364 150 L360 118 Q359 110 352 114 L318 143 Z"/>
+    </g>
+    <rect x="100" y="152" width="312" height="226" rx="50" fill="#FF6FA6" stroke="#4B1D3F" stroke-width="14"/>
+    <g fill="#FFB8D3"><circle cx="142" cy="175" r="7"/><circle cx="164" cy="175" r="7"/><circle cx="186" cy="175" r="7"/></g>
+    <rect x="124" y="194" width="264" height="160" rx="30" fill="#2A1531" stroke="#4B1D3F" stroke-width="11.200000000000001"/>
+    <g fill="none" stroke="#FFB8D3" stroke-width="16">
+      <path d="M192 214 v6 a15 15 0 0 0 30 0 v-6"/>
+      <path d="M290 214 v6 a15 15 0 0 0 30 0 v-6"/>
+      <path d="M232 254 q12 14 24 0 q12 14 24 0"/>
+      <path d="M150 302 L174 320 L150 338" stroke-width="13"/>
+    </g>
+    <rect x="186" y="326" width="46" height="13" rx="6" fill="#FFD66E"/>
+    <g fill="#FF4D8D" opacity="0.75"><ellipse cx="168" cy="262" rx="15" ry="8.5"/><ellipse cx="344" cy="262" rx="15" ry="8.5"/></g>
+  </g></g>
+  </g>
+  <g stroke="#4B1D3F" stroke-linejoin="round">
+    <path d="M80 54 Q85 85 116 90 Q85 95 80 126 Q75 95 44 90 Q75 85 80 54Z" fill="#FFD66E" stroke-width="8"/>
+    <path d="M448 130 Q450.8 147.2 468 150 Q450.8 152.8 448 170 Q445.2 152.8 428 150 Q445.2 147.2 448 130Z" fill="#FFD66E" stroke-width="6"/>
+    <path transform="translate(80 436) scale(1) translate(-434 -437)" d="M434 462 C410 446 403 433 406 423 C409 412 423 409 430 418 L434 424 L438 418 C445 409 459 412 462 423 C465 433 458 446 434 462Z" fill="#FF6FA6" stroke-width="8"/>
+  </g>
+</svg>

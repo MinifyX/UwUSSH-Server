@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="brand/uwussh-app-icon.svg" width="112" alt="UwUSSH logo" />
+</p>
+
 # UwUSSH Server
 
 The sync server behind [UwUSSH](https://github.com/MinifyX/UwUSSH-Client): your
