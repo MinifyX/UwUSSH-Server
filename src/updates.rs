@@ -4,7 +4,7 @@
 //! its channel is newer than itself, says so in its log along with the one
 //! command that updates it. A build of `main` (the `edge` tag) asks how many
 //! commits came since instead. That is the only connection this server ever
-//! opens on its own, and `UWUSSH_UPDATE_CHECK=off` stops it.
+//! opens on its own, and `UWUSYNC_UPDATE_CHECK=off` stops it.
 //!
 //! Updating is not something the server does to itself: `update.sh` does it on
 //! the machine, with a backup first and the old version back if the new one
@@ -35,8 +35,8 @@ pub struct Build {
 pub fn build() -> Build {
     Build {
         version: env!("CARGO_PKG_VERSION"),
-        commit: option_env!("UWUSSH_GIT_SHA").filter(|sha| !sha.is_empty()),
-        release: option_env!("UWUSSH_RELEASE").is_some_and(|tag| !tag.is_empty()),
+        commit: option_env!("UWUSYNC_GIT_SHA").filter(|sha| !sha.is_empty()),
+        release: option_env!("UWUSYNC_RELEASE").is_some_and(|tag| !tag.is_empty()),
     }
 }
 
@@ -57,8 +57,8 @@ pub enum Channel {
 }
 
 impl Channel {
-    /// From the tag the machine follows (`UWUSSH_VERSION` in `.env`, handed in
-    /// as `UWUSSH_CHANNEL`), and from what is running: a beta that is told
+    /// From the tag the machine follows (`UWUSYNC_VERSION` in `.env`, handed in
+    /// as `UWUSYNC_CHANNEL`), and from what is running: a beta that is told
     /// about stable releases only would hear nothing until the next one.
     pub fn of(followed: Option<&str>, running: &str) -> Self {
         if followed.is_some_and(|tag| tag.trim().eq_ignore_ascii_case("beta"))
@@ -147,7 +147,7 @@ pub enum Finding {
 /// restarted in a loop does not ask GitHub every time.
 pub fn spawn(config: Arc<Config>) {
     if !config.update_check {
-        tracing::info!("not checking for updates (UWUSSH_UPDATE_CHECK=off)");
+        tracing::info!("not checking for updates (UWUSYNC_UPDATE_CHECK=off)");
         return;
     }
     tokio::spawn(async move {
@@ -158,7 +158,7 @@ pub fn spawn(config: Arc<Config>) {
                 Ok(Finding::Release { version, url }) => tracing::info!(
                     running = build().version,
                     %url,
-                    "UwUSSH Server {version} is out. To update: sudo bash update.sh, next to compose.yaml"
+                    "UwUSync Server {version} is out. To update: sudo bash update.sh, next to compose.yaml"
                 ),
                 Ok(Finding::Commits(count)) => tracing::info!(
                     "main is {count} commit(s) ahead of this build. To update: sudo bash update.sh, next to compose.yaml"
@@ -216,7 +216,7 @@ fn client() -> Result<reqwest::Client, String> {
     .with_no_client_auth();
     reqwest::Client::builder()
         .use_preconfigured_tls(tls)
-        .user_agent(concat!("uwussh-server/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("uwusync-server/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|error| error.to_string())
@@ -308,6 +308,6 @@ mod tests {
 
     #[test]
     fn the_repository_comes_from_the_package() {
-        assert_eq!(repository(), "MinifyX/UwUSSH-Server");
+        assert_eq!(repository(), "MinifyX/UwUSync-Server");
     }
 }

@@ -25,7 +25,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  IMAGE: ghcr.io/minifyx/uwussh-server
+  IMAGE: ghcr.io/minifyx/uwusync-server
+  LEGACY_IMAGE: ghcr.io/minifyx/uwussh-server
 
 jobs:
   test:
@@ -92,8 +93,8 @@ jobs:
     env:
       # The server knows its commit and, for a release, checks for newer releases instead of
       # newer commits.
-      UWUSSH_GIT_SHA: ${{ github.sha }}
-      UWUSSH_RELEASE: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+      UWUSYNC_GIT_SHA: ${{ github.sha }}
+      UWUSYNC_RELEASE: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -117,10 +118,10 @@ jobs:
       - name: Collect them
         run: |
           mkdir -p dist/amd64 dist/arm64
-          cp target/x86_64-unknown-linux-gnu/release/uwussh-server dist/amd64/
-          cp target/aarch64-unknown-linux-gnu/release/uwussh-server dist/arm64/
-          dist/amd64/uwussh-server --version
-          file dist/arm64/uwussh-server | grep -q aarch64
+          cp target/x86_64-unknown-linux-gnu/release/uwusync-server dist/amd64/
+          cp target/aarch64-unknown-linux-gnu/release/uwusync-server dist/arm64/
+          dist/amd64/uwusync-server --version
+          file dist/arm64/uwusync-server | grep -q aarch64
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: binaries
@@ -141,7 +142,7 @@ jobs:
           path: dist
       - name: Three versions, only on this machine
         run: |
-          chmod +x dist/*/uwussh-server
+          chmod +x dist/*/uwusync-server
           # Two of the same build under two version numbers, and one that never comes up.
           docker build -q -f docker/Dockerfile.release \
             --label org.opencontainers.image.version=0.0.1 -t "$IMAGE:0.0.1" .
@@ -158,8 +159,8 @@ jobs:
           sudo chmod 755 /opt
           sudo bash install.sh --yes --no-pull --from-checkout --version 0.0.1 --public localhost |
             tee install.log
-          test "$(sudo stat -c %a /opt/uwussh/.env)" = 600
-          sudo grep -qx 'UWUSSH_PUBLIC=localhost:8443' /opt/uwussh/.env
+          test "$(sudo stat -c %a /opt/uwusync/.env)" = 600
+          sudo grep -qx 'UWUSYNC_PUBLIC=localhost:8443' /opt/uwusync/.env
 
           # What the setup code says is what the server says, and what it serves.
           code=$(grep -oE 'uwu1_[A-Za-z0-9_-]+' install.log | head -1)
@@ -169,8 +170,8 @@ jobs:
           echo "$setup"
           test "$(jq -r .u <<<"$setup")" = https://localhost:8443
           pinned=$(jq -r .f <<<"$setup")
-          cd /opt/uwussh
-          shown=$(sudo docker compose exec -T uwussh uwussh-server fingerprint | head -1)
+          cd /opt/uwusync
+          shown=$(sudo docker compose exec -T uwusync uwusync-server fingerprint | head -1)
           test "$pinned" = "$shown"
           served=$(openssl s_client -connect localhost:8443 </dev/null 2>/dev/null |
             openssl x509 -pubkey -noout | openssl pkey -pubin -outform der |
@@ -181,62 +182,133 @@ jobs:
         run: |
           # SIGTERM, not ten seconds of waiting and then SIGKILL.
           start=$(date +%s)
-          sudo docker stop uwussh
+          sudo docker stop uwusync
           test $(( $(date +%s) - start )) -lt 8
-          sudo docker start uwussh
+          sudo docker start uwusync
       - name: Update, keeping the key and making a backup
         run: |
-          cd /opt/uwussh
-          before=$(sudo docker compose exec -T uwussh uwussh-server fingerprint | head -1)
+          cd /opt/uwusync
+          before=$(sudo docker compose exec -T uwusync uwusync-server fingerprint | head -1)
           sudo bash update.sh --yes --no-pull --no-self-update --keep-compose --version 0.0.2
           label='{{index .Config.Labels "org.opencontainers.image.version"}}'
-          test "$(sudo docker inspect uwussh --format "$label")" = 0.0.2
-          test "$(sudo docker inspect uwussh --format '{{.State.Health.Status}}')" = healthy
-          after=$(sudo docker compose exec -T uwussh uwussh-server fingerprint | head -1)
+          test "$(sudo docker inspect uwusync --format "$label")" = 0.0.2
+          test "$(sudo docker inspect uwusync --format '{{.State.Health.Status}}')" = healthy
+          after=$(sudo docker compose exec -T uwusync uwusync-server fingerprint | head -1)
           test "$before" = "$after"
-          sudo docker compose cp uwussh:/data/backups "$RUNNER_TEMP/backups"
-          sudo ls "$RUNNER_TEMP/backups" | grep -qE '^uwussh-[0-9-]+\.db$'
+          sudo docker compose cp uwusync:/data/backups "$RUNNER_TEMP/backups"
+          sudo ls "$RUNNER_TEMP/backups" | grep -qE '^uwusync-[0-9-]+\.db$'
       - name: A version that does not come up puts the one before back
         run: |
-          cd /opt/uwussh
+          cd /opt/uwusync
           if sudo bash update.sh --yes --no-pull --no-self-update --version 0.0.3; then
             echo "update.sh should have given up on 0.0.3" >&2
             exit 1
           fi
-          sudo grep -qx 'UWUSSH_VERSION=0.0.2' .env
+          sudo grep -qx 'UWUSYNC_VERSION=0.0.2' .env
+          for _ in $(seq 1 30); do
+            [ "$(sudo docker inspect uwusync --format '{{.State.Health.Status}}')" = healthy ] && break
+            sleep 2
+          done
+          label='{{index .Config.Labels "org.opencontainers.image.version"}}'
+          test "$(sudo docker inspect uwusync --format "$label")" = 0.0.2
+          test "$(sudo docker inspect uwusync --format '{{.State.Health.Status}}')" = healthy
+      - name: A backup goes back, but not under a running server
+        run: |
+          cd /opt/uwusync
+          name=$(sudo docker compose run --rm -T uwusync restore | head -1 | cut -d' ' -f1)
+          echo "restoring $name"
+          if sudo docker compose run --rm -T uwusync restore "$name"; then
+            echo "a restore under a running server should have been refused" >&2
+            exit 1
+          fi
+          sudo docker compose stop
+          sudo docker compose run --rm -T uwusync restore "$name" | tee "$RUNNER_TEMP/restore.log"
+          grep -q 'Restored from' "$RUNNER_TEMP/restore.log"
+          sudo docker compose up -d
+          for _ in $(seq 1 30); do
+            [ "$(sudo docker inspect uwusync --format '{{.State.Health.Status}}')" = healthy ] && break
+            sleep 2
+          done
+          test "$(sudo docker inspect uwusync --format '{{.State.Health.Status}}')" = healthy
+      - name: What the server said
+        if: always()
+        run: cd /opt/uwusync && sudo docker compose logs --no-color || true
+
+  move:
+    name: From UwUSSH Server
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: binaries
+          path: dist
+      - name: UwUSSH Server 0.1.1, set up the way its own install.sh did it
+        run: |
+          sudo chown root:root /opt
+          sudo chmod 755 /opt
+          git fetch --no-tags --depth=1 origin +refs/tags/v0.1.1:refs/tags/v0.1.1
+          git worktree add "$RUNNER_TEMP/legacy" v0.1.1
+          sudo bash "$RUNNER_TEMP/legacy/install.sh" --yes --from-checkout --version 0.1.1 \
+            --public localhost
+          cd /opt/uwussh
+          sudo docker compose exec -T uwussh uwussh-server fingerprint | head -1 >"$RUNNER_TEMP/before"
+          test -s "$RUNNER_TEMP/before"
+      - name: Two new versions, only on this machine
+        run: |
+          chmod +x dist/*/uwusync-server
+          docker build -q -f docker/Dockerfile.release \
+            --label org.opencontainers.image.version=0.0.2 -t "$IMAGE:0.0.2" .
+          printf 'FROM %s\nCMD ["no-such-command"]\n' "$IMAGE:0.0.2" |
+            docker build -q --label org.opencontainers.image.version=0.0.3 -t "$IMAGE:0.0.3" -
+      - name: A move that does not come up leaves UwUSSH Server as it was
+        run: |
+          if sudo bash update.sh --dir /opt/uwussh --yes --no-pull --no-self-update \
+            --from-checkout --version 0.0.3; then
+            echo "update.sh should have given up on 0.0.3" >&2
+            exit 1
+          fi
           for _ in $(seq 1 30); do
             [ "$(sudo docker inspect uwussh --format '{{.State.Health.Status}}')" = healthy ] && break
             sleep 2
           done
           label='{{index .Config.Labels "org.opencontainers.image.version"}}'
-          test "$(sudo docker inspect uwussh --format "$label")" = 0.0.2
-          test "$(sudo docker inspect uwussh --format '{{.State.Health.Status}}')" = healthy
-      - name: A backup goes back, but not under a running server
+          test "$(sudo docker inspect uwussh --format "$label")" = 0.1.1
+          if sudo docker inspect uwusync >/dev/null 2>&1; then exit 1; fi
+          sudo grep -qx 'UWUSSH_PUBLIC=localhost:8443' /opt/uwussh/.env
+          sudo grep -qx 'UWUSSH_VERSION=0.1.1' /opt/uwussh/.env
+          sudo grep -q 'uwussh-server' /opt/uwussh/compose.yaml
+      - name: The move, with the same data and the same key
         run: |
+          sudo bash update.sh --dir /opt/uwussh --yes --no-pull --no-self-update \
+            --from-checkout --version 0.0.2
+          label='{{index .Config.Labels "org.opencontainers.image.version"}}'
+          test "$(sudo docker inspect uwusync --format "$label")" = 0.0.2
+          test "$(sudo docker inspect uwusync --format '{{.State.Health.Status}}')" = healthy
+          if sudo docker inspect uwussh >/dev/null 2>&1; then exit 1; fi
           cd /opt/uwussh
-          name=$(sudo docker compose run --rm -T uwussh restore | head -1 | cut -d' ' -f1)
-          echo "restoring $name"
-          if sudo docker compose run --rm -T uwussh restore "$name"; then
-            echo "a restore under a running server should have been refused" >&2
-            exit 1
-          fi
-          sudo docker compose stop
-          sudo docker compose run --rm -T uwussh restore "$name" | tee "$RUNNER_TEMP/restore.log"
-          grep -q 'Restored from' "$RUNNER_TEMP/restore.log"
-          sudo docker compose up -d
-          for _ in $(seq 1 30); do
-            [ "$(sudo docker inspect uwussh --format '{{.State.Health.Status}}')" = healthy ] && break
-            sleep 2
-          done
-          test "$(sudo docker inspect uwussh --format '{{.State.Health.Status}}')" = healthy
-      - name: What the server said
+          sudo grep -qx 'UWUSYNC_PUBLIC=localhost:8443' .env
+          sudo grep -qx 'UWUSYNC_VERSION=0.0.2' .env
+          sudo grep -qx 'UWUSYNC_VOLUME=uwussh_uwussh-data' .env
+          if sudo grep -q '^UWUSSH_' .env; then exit 1; fi
+          test -f .uwusync-update && test ! -e .uwussh-update
+          after=$(sudo docker compose exec -T uwusync uwusync-server fingerprint | head -1)
+          test "$(cat "$RUNNER_TEMP/before")" = "$after"
+          # The database kept its name, and the backup from before the move is listed.
+          sudo docker compose exec -T uwusync uwusync-server restore | grep -qE '^uwussh-[0-9-]+\.db'
+          sudo docker compose exec -T uwusync uwussh-server --version
+          curl -skf https://localhost:8443/healthz
+      - name: What the servers said
         if: always()
         run: cd /opt/uwussh && sudo docker compose logs --no-color || true
 
   image:
     name: Container image
     if: github.event_name != 'pull_request'
-    needs: [test, scripts, audit, install, version]
+    needs: [test, scripts, audit, install, move, version]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -251,7 +323,7 @@ jobs:
         with:
           name: binaries
           path: dist
-      - run: chmod +x dist/*/uwussh-server
+      - run: chmod +x dist/*/uwusync-server
       # No QEMU: the only stage that runs anything runs on the machine that builds.
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
@@ -262,7 +334,11 @@ jobs:
       - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         id: meta
         with:
-          images: ${{ env.IMAGE }}
+          # Under its name from before as well: a machine that keeps a compose.yaml from when it
+          # was UwUSSH Server (--keep-compose) still pulls that one, and still gets updates.
+          images: |
+            ${{ env.IMAGE }}
+            ${{ env.LEGACY_IMAGE }}
           tags: |
             type=raw,value=edge,enable={{is_default_branch}}
             # Every release, stable or not; stable ones also get latest.
@@ -279,7 +355,7 @@ jobs:
           file: docker/Dockerfile.release
           platforms: linux/amd64
           load: true
-          tags: uwussh-server:scan
+          tags: uwusync-server:scan
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Install Trivy
@@ -295,9 +371,9 @@ jobs:
         run: |
           # Fail only on vulnerabilities that have a fix available; log the rest.
           "$RUNNER_TEMP/trivy" image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
-            --exit-code 1 --no-progress uwussh-server:scan
+            --exit-code 1 --no-progress uwusync-server:scan
       - name: Check the image starts, before it goes anywhere
-        run: docker run --rm uwussh-server:scan --version
+        run: docker run --rm uwusync-server:scan --version
       - name: Push the image
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
@@ -351,7 +427,7 @@ jobs:
         run: |
           flags=""
           case "$GITHUB_REF_NAME" in *-*) flags="--prerelease" ;; esac
-          gh release create "$GITHUB_REF_NAME" $flags --title "UwUSSH Server ${GITHUB_REF_NAME#v}" \
+          gh release create "$GITHUB_REF_NAME" $flags --title "UwUSync Server ${GITHUB_REF_NAME#v}" \
             --notes-file notes.md \
             release/install.sh release/install.sh.sha256 \
             release/update.sh release/update.sh.sha256 \

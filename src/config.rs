@@ -32,7 +32,7 @@ impl TlsMode {
 pub enum Registration {
     /// Anyone who can reach the server. For a server on a tailnet, say.
     Open,
-    /// Only with a code from `uwussh-server invite`. The default, and what the
+    /// Only with a code from `uwusync-server invite`. The default, and what the
     /// first start prints one of.
     Invite,
     /// Nobody. For a server whose devices are all enrolled.
@@ -117,69 +117,79 @@ impl Config {
     pub fn from_env() -> Result<Self, String> {
         let mut config = Config::default();
 
-        if let Some(dir) = var("UWUSSH_DATA") {
+        if let Some(dir) = var("UWUSYNC_DATA") {
             config.data_dir = PathBuf::from(dir);
         }
-        if let Some(listen) = var("UWUSSH_LISTEN") {
+        if let Some(listen) = var("UWUSYNC_LISTEN") {
             config.listen = listen
                 .parse()
-                .map_err(|_| format!("UWUSSH_LISTEN is not an address: {listen}"))?;
+                .map_err(|_| format!("UWUSYNC_LISTEN is not an address: {listen}"))?;
         }
-        config.public = var("UWUSSH_PUBLIC");
-        if let Some(registration) = var("UWUSSH_REGISTRATION") {
+        config.public = var("UWUSYNC_PUBLIC");
+        if let Some(registration) = var("UWUSYNC_REGISTRATION") {
             config.registration = Registration::parse(&registration).ok_or_else(|| {
-                format!("UWUSSH_REGISTRATION must be open, invite or closed: {registration}")
+                format!("UWUSYNC_REGISTRATION must be open, invite or closed: {registration}")
             })?;
         }
-        if let Some(tls) = var("UWUSSH_TLS") {
+        if let Some(tls) = var("UWUSYNC_TLS") {
             config.tls = TlsMode::parse(&tls)
-                .ok_or_else(|| format!("UWUSSH_TLS must be auto or off: {tls}"))?;
+                .ok_or_else(|| format!("UWUSYNC_TLS must be auto or off: {tls}"))?;
         }
-        if let Some(trust) = var("UWUSSH_TRUST_FORWARDED") {
+        if let Some(trust) = var("UWUSYNC_TRUST_FORWARDED") {
             config.trust_forwarded = switch(&trust)
-                .ok_or_else(|| format!("UWUSSH_TRUST_FORWARDED must be on or off: {trust}"))?;
+                .ok_or_else(|| format!("UWUSYNC_TRUST_FORWARDED must be on or off: {trust}"))?;
         }
-        if let Some(secs) = var("UWUSSH_SESSION_SECS") {
+        if let Some(secs) = var("UWUSYNC_SESSION_SECS") {
             config.session_secs = secs
                 .parse()
-                .map_err(|_| format!("UWUSSH_SESSION_SECS is not a number: {secs}"))?;
+                .map_err(|_| format!("UWUSYNC_SESSION_SECS is not a number: {secs}"))?;
         }
-        if let Some(check) = var("UWUSSH_UPDATE_CHECK") {
+        if let Some(check) = var("UWUSYNC_UPDATE_CHECK") {
             config.update_check = switch(&check)
-                .ok_or_else(|| format!("UWUSSH_UPDATE_CHECK must be on or off: {check}"))?;
+                .ok_or_else(|| format!("UWUSYNC_UPDATE_CHECK must be on or off: {check}"))?;
         }
-        config.channel = var("UWUSSH_CHANNEL");
-        if let Some(max) = var("UWUSSH_MAX_ACCOUNTS") {
-            config.max_accounts = number("UWUSSH_MAX_ACCOUNTS", &max)?;
+        config.channel = var("UWUSYNC_CHANNEL");
+        if let Some(max) = var("UWUSYNC_MAX_ACCOUNTS") {
+            config.max_accounts = number("UWUSYNC_MAX_ACCOUNTS", &max)?;
         }
-        if let Some(records) = var("UWUSSH_ACCOUNT_MAX_RECORDS") {
-            config.quota.records = number("UWUSSH_ACCOUNT_MAX_RECORDS", &records)?;
+        if let Some(records) = var("UWUSYNC_ACCOUNT_MAX_RECORDS") {
+            config.quota.records = number("UWUSYNC_ACCOUNT_MAX_RECORDS", &records)?;
         }
-        if let Some(megabytes) = var("UWUSSH_ACCOUNT_MAX_MB") {
-            config.quota.bytes = number("UWUSSH_ACCOUNT_MAX_MB", &megabytes)?
+        if let Some(megabytes) = var("UWUSYNC_ACCOUNT_MAX_MB") {
+            config.quota.bytes = number("UWUSYNC_ACCOUNT_MAX_MB", &megabytes)?
                 .checked_mul(1024 * 1024)
-                .ok_or("UWUSSH_ACCOUNT_MAX_MB is more than any disk")?;
+                .ok_or("UWUSYNC_ACCOUNT_MAX_MB is more than any disk")?;
         }
-        if let Some(megabytes) = var("UWUSSH_SERVER_MAX_MB") {
-            config.quota.server_bytes = number("UWUSSH_SERVER_MAX_MB", &megabytes)?
+        if let Some(megabytes) = var("UWUSYNC_SERVER_MAX_MB") {
+            config.quota.server_bytes = number("UWUSYNC_SERVER_MAX_MB", &megabytes)?
                 .checked_mul(1024 * 1024)
-                .ok_or("UWUSSH_SERVER_MAX_MB is more than any disk")?;
+                .ok_or("UWUSYNC_SERVER_MAX_MB is more than any disk")?;
         }
-        if let Some(max) = var("UWUSSH_MAX_CONNECTIONS") {
-            config.max_connections = number("UWUSSH_MAX_CONNECTIONS", &max)? as usize;
+        if let Some(max) = var("UWUSYNC_MAX_CONNECTIONS") {
+            config.max_connections = number("UWUSYNC_MAX_CONNECTIONS", &max)? as usize;
             if config.max_connections == 0 {
-                return Err("UWUSSH_MAX_CONNECTIONS of 0 would let nobody in".into());
+                return Err("UWUSYNC_MAX_CONNECTIONS of 0 would let nobody in".into());
             }
         }
-        if let Some(max) = var("UWUSSH_MAX_CONNECTIONS_PER_IP") {
+        if let Some(max) = var("UWUSYNC_MAX_CONNECTIONS_PER_IP") {
             config.max_connections_per_address =
-                number("UWUSSH_MAX_CONNECTIONS_PER_IP", &max)? as usize;
+                number("UWUSYNC_MAX_CONNECTIONS_PER_IP", &max)? as usize;
         }
         Ok(config)
     }
 
+    /// `uwusync.db` — or `uwussh.db`, from before the server was called
+    /// UwUSync, when that is the one there is. It keeps that name rather than
+    /// being renamed: a rollback to a version from before would not find it
+    /// under the new one, and start again empty.
     pub fn database(&self) -> PathBuf {
-        self.data_dir.join("uwussh.db")
+        let current = self.data_dir.join("uwusync.db");
+        let legacy = self.data_dir.join("uwussh.db");
+        if !current.exists() && legacy.exists() {
+            legacy
+        } else {
+            current
+        }
     }
 
     pub fn backups(&self) -> PathBuf {
@@ -201,8 +211,33 @@ impl Config {
     }
 }
 
+/// A setting, under its name — or under the one it had while the server was
+/// UwUSSH Server (`UWUSSH_` for `UWUSYNC_`), so an `.env` from then still
+/// counts. The new name wins where both are set.
 fn var(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.is_empty())
+    let read = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    read(name).or_else(|| read(&legacy_name(name)?))
+}
+
+const LEGACY_PREFIX: &str = "UWUSSH_";
+
+fn legacy_name(name: &str) -> Option<String> {
+    name.strip_prefix("UWUSYNC_")
+        .map(|rest| format!("{LEGACY_PREFIX}{rest}"))
+}
+
+/// The settings that are only set under their old `UWUSSH_` name, for a
+/// word in the log that they have a new one.
+pub fn legacy_variables() -> Vec<String> {
+    let mut names: Vec<String> = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| {
+            name.strip_prefix(LEGACY_PREFIX)
+                .is_some_and(|rest| std::env::var_os(format!("UWUSYNC_{rest}")).is_none())
+        })
+        .collect();
+    names.sort();
+    names
 }
 
 fn number(name: &str, value: &str) -> Result<u64, String> {
@@ -232,7 +267,7 @@ mod tests {
         assert_eq!(config.tls, TlsMode::Auto, "secure without being asked");
         assert!(!config.trust_forwarded, "off unless a proxy is in front");
         assert!(config.update_check);
-        assert_eq!(config.database().file_name().unwrap(), "uwussh.db");
+        assert_eq!(config.database().file_name().unwrap(), "uwusync.db");
         assert_eq!(config.quota.server_bytes, 2048 * 1024 * 1024);
         assert_eq!(config.max_connections, 512);
         assert_eq!(config.max_connections_per_address, 32);
@@ -258,10 +293,39 @@ mod tests {
 
         let proxied = Config {
             tls: TlsMode::Off,
-            public: Some("https://uwussh.example.com/".into()),
+            public: Some("https://uwusync.example.com/".into()),
             ..Config::default()
         };
-        assert_eq!(proxied.base_url(), "https://uwussh.example.com");
+        assert_eq!(proxied.base_url(), "https://uwusync.example.com");
+    }
+
+    #[test]
+    fn a_setting_keeps_its_name_from_before() {
+        assert_eq!(
+            legacy_name("UWUSYNC_PUBLIC").as_deref(),
+            Some("UWUSSH_PUBLIC")
+        );
+        assert_eq!(legacy_name("RUST_LOG"), None);
+    }
+
+    #[test]
+    fn a_database_from_before_the_new_name_is_used_where_it_is() {
+        let dir = std::env::temp_dir().join(format!("uwusync-legacy-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = Config {
+            data_dir: dir.clone(),
+            ..Config::default()
+        };
+        assert_eq!(config.database(), dir.join("uwusync.db"), "a new server");
+        std::fs::write(dir.join("uwussh.db"), b"x").unwrap();
+        assert_eq!(config.database(), dir.join("uwussh.db"), "one from before");
+        std::fs::write(dir.join("uwusync.db"), b"x").unwrap();
+        assert_eq!(
+            config.database(),
+            dir.join("uwusync.db"),
+            "the new one wins"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -1,11 +1,13 @@
 <p align="center">
-  <img src="brand/uwussh-app-icon.svg" width="112" alt="UwUSSH logo" />
+  <img src="brand/uwusync-app-icon.svg" width="112" alt="UwUSync logo" />
 </p>
 
-# UwUSSH Server
+# UwUSync Server
 
-The sync server behind [UwUSSH](https://github.com/MinifyX/UwUSSH-Client): your
-hosts, keys and passwords on all your devices, on a machine that belongs to you.
+The sync server behind [UwUSSH](https://github.com/MinifyX/UwUSSH-Client) and
+[UwURDP](https://github.com/MinifyX/UwURDP-Client): your hosts, keys and
+passwords on all your devices, on a machine that belongs to you. It was called
+UwUSSH Server until it started carrying more than SSH.
 
 It is a **dumb, encrypted mailbox**. It hands out sequence numbers, keeps the
 newest version of every record, pages through them from a cursor, and refuses a
@@ -21,19 +23,19 @@ subscription.
 On a Linux machine — a NAS, a Raspberry Pi, a small VPS, amd64 or arm64:
 
 ```bash
-curl -fsSLO https://github.com/MinifyX/UwUSSH-Server/releases/latest/download/install.sh
+curl -fsSLO https://github.com/MinifyX/UwUSync-Server/releases/latest/download/install.sh
 sudo bash install.sh
 ```
 
 It installs Docker when it is missing, asks one thing — how your devices reach
-this machine — sets up `/opt/uwussh`, starts the server and shows a **setup
+this machine — sets up `/opt/uwusync`, starts the server and shows a **setup
 code**: one string carrying the address, the certificate's fingerprint and an
-invite. Paste it into UwUSSH under Settings → Sync, type your master password
+invite. Paste it into UwUSSH or UwURDP under Settings → Sync, type your master password
 once, and that device is in. Every other device joins from the first one, with
 three words it shows you.
 
 ```
-  UwUSSH Server is running (=^･ω･^=)
+  UwUSync Server is running (=^･ω･^=)
 
   Setup code    uwu1_eyJ1IjoiaHR0cHM6Ly8xOTIuMTY4LjEuMjA6ODQ0MyIsImki…
   Address       https://192.168.1.20:8443
@@ -41,29 +43,33 @@ three words it shows you.
 ```
 
 Without questions: `sudo bash install.sh --public nas.lan --yes`. Another code
-for another account: `docker compose exec uwussh uwussh-server invite` in
-`/opt/uwussh`. `--help` lists every flag, and
+for another account: `docker compose exec uwusync uwusync-server invite` in
+`/opt/uwusync`. `--help` lists every flag, and
 [docs/deployment.md](docs/deployment.md) has the whole way: by hand, behind a
 reverse proxy, backups and restoring them, moving to another machine.
 
-Without Docker: `cargo build --release`, then run `uwussh-server`. It needs a
-folder (`UWUSSH_DATA`, `./data` by default) and nothing else.
+Without Docker: `cargo build --release`, then run `uwusync-server`. It needs a
+folder (`UWUSYNC_DATA`, `./data` by default) and nothing else.
 
 ## Update
 
 ```bash
-cd /opt/uwussh && sudo bash update.sh
+cd /opt/uwusync && sudo bash update.sh
 ```
 
 It takes a newer copy of itself first, then a backup, then the new image — and
 waits for the server's health check. If the new version does not come up, the
-one from before goes back in. `UWUSSH_VERSION` in `.env` says what the
+one from before goes back in. `UWUSYNC_VERSION` in `.env` says what the
 machine follows: `latest` for stable releases, `beta` for every release,
 `edge` for every commit on `main` that passed CI, or one exact version.
 
+Set up while it was UwUSSH Server? `cd /opt/uwussh && sudo bash update.sh`
+moves it over, with its data, its key and its devices:
+[docs/deployment.md](docs/deployment.md#from-uwussh-server).
+
 Once a day the server asks GitHub whether there is something newer on that
 channel and says so in its log. It is the only connection it ever opens on its
-own; `UWUSSH_UPDATE_CHECK=off` stops it. Nothing installs itself: a sync
+own; `UWUSYNC_UPDATE_CHECK=off` stops it. Nothing installs itself: a sync
 server that could replace itself from the network would be one more way in.
 
 ## Adding a second device
@@ -122,42 +128,42 @@ be told its password was wrong, and would go looking in the wrong place.
 
 | Variable                 | Default            | What it does                                                      |
 | ------------------------ | ------------------ | ----------------------------------------------------------------- |
-| `UWUSSH_DATA`            | `./data`           | Database, certificate key, and backups under `backups/`            |
-| `UWUSSH_LISTEN`          | `0.0.0.0:8443`     | Address to listen on                                              |
-| `UWUSSH_PUBLIC`          | the listen address | How devices reach this server; goes into the setup code           |
-| `UWUSSH_TLS`             | `auto`             | `auto` for its own certificate, `off` when a proxy does the TLS    |
-| `UWUSSH_REGISTRATION`    | `invite`           | `open`, `invite` or `closed`                                      |
-| `UWUSSH_TRUST_FORWARDED` | `off`              | Believe the last `X-Forwarded-For` address — only behind a proxy  |
-| `UWUSSH_SESSION_SECS`    | `3600`             | How long a device's token lasts before it signs a challenge again |
-| `UWUSSH_UPDATE_CHECK`    | `on`               | Ask GitHub once a day whether there is a newer release            |
-| `UWUSSH_MAX_ACCOUNTS`    | `100`              | How many accounts the server takes, whoever asks                  |
-| `UWUSSH_ACCOUNT_MAX_RECORDS` | `100000`       | What one account may hold, in records…                            |
-| `UWUSSH_ACCOUNT_MAX_MB`  | `256`              | …and in megabytes                                                 |
-| `UWUSSH_SERVER_MAX_MB`   | `2048`             | What all accounts together may hold, in megabytes                 |
-| `UWUSSH_MAX_CONNECTIONS` | `512`              | Connections open at once, from everybody                          |
-| `UWUSSH_MAX_CONNECTIONS_PER_IP` | `32`       | …and from one address (an IPv6 /64); `0` for no limit. Not applied behind a proxy |
+| `UWUSYNC_DATA`            | `./data`           | Database, certificate key, and backups under `backups/`            |
+| `UWUSYNC_LISTEN`          | `0.0.0.0:8443`     | Address to listen on                                              |
+| `UWUSYNC_PUBLIC`          | the listen address | How devices reach this server; goes into the setup code           |
+| `UWUSYNC_TLS`             | `auto`             | `auto` for its own certificate, `off` when a proxy does the TLS    |
+| `UWUSYNC_REGISTRATION`    | `invite`           | `open`, `invite` or `closed`                                      |
+| `UWUSYNC_TRUST_FORWARDED` | `off`              | Believe the last `X-Forwarded-For` address — only behind a proxy  |
+| `UWUSYNC_SESSION_SECS`    | `3600`             | How long a device's token lasts before it signs a challenge again |
+| `UWUSYNC_UPDATE_CHECK`    | `on`               | Ask GitHub once a day whether there is a newer release            |
+| `UWUSYNC_MAX_ACCOUNTS`    | `100`              | How many accounts the server takes, whoever asks                  |
+| `UWUSYNC_ACCOUNT_MAX_RECORDS` | `100000`       | What one account may hold, in records…                            |
+| `UWUSYNC_ACCOUNT_MAX_MB`  | `256`              | …and in megabytes                                                 |
+| `UWUSYNC_SERVER_MAX_MB`   | `2048`             | What all accounts together may hold, in megabytes                 |
+| `UWUSYNC_MAX_CONNECTIONS` | `512`              | Connections open at once, from everybody                          |
+| `UWUSYNC_MAX_CONNECTIONS_PER_IP` | `32`       | …and from one address (an IPv6 /64); `0` for no limit. Not applied behind a proxy |
 
 With Docker these come from `.env` next to `compose.yaml`, which install.sh
-writes; `UWUSSH_BIND` there says where the container is published and
-`UWUSSH_VERSION` which image it runs.
+writes; `UWUSYNC_BIND` there says where the container is published and
+`UWUSYNC_VERSION` which image it runs.
 
 ## The commands
 
 ```
-uwussh-server                  serve (the default)
-uwussh-server invite           a code for one new account, good for a week
-uwussh-server fingerprint      what a device pins, to compare by eye
-uwussh-server accounts         what is on this server, and how many devices each has
-uwussh-server devices <id>     the devices of an account
-uwussh-server revoke <id>      shut a device out
-uwussh-server backup           a consistent copy, right now
-uwussh-server restore [name]   list the backups, or put one back (server stopped)
-uwussh-server health           the container's health check
-uwussh-server new-key          a new certificate key, when the old one is lost for good
+uwusync-server                  serve (the default)
+uwusync-server invite           a code for one new account, good for a week
+uwusync-server fingerprint      what a device pins, to compare by eye
+uwusync-server accounts         what is on this server, and how many devices each has
+uwusync-server devices <id>     the devices of an account
+uwusync-server revoke <id>      shut a device out
+uwusync-server backup           a consistent copy, right now
+uwusync-server restore [name]   list the backups, or put one back (server stopped)
+uwusync-server health           the container's health check
+uwusync-server new-key          a new certificate key, when the old one is lost for good
 ```
 
-In Docker: `docker compose exec uwussh uwussh-server <command>`, from
-`/opt/uwussh`.
+In Docker: `docker compose exec uwusync uwusync-server <command>`, from
+`/opt/uwusync`.
 
 Backups run by themselves too: one a night, and one more before every update,
 seven kept in all — written with `VACUUM INTO`, because copying a live SQLite
@@ -169,7 +175,7 @@ and keeps the database it replaces.
 
 **How much disk it takes.** A vault of hosts, keys and snippets is a few
 megabytes, so a household server stays in megabytes. The ceiling is set by
-`UWUSSH_SERVER_MAX_MB`: at the default 2 GiB, the database and seven backups
+`UWUSYNC_SERVER_MAX_MB`: at the default 2 GiB, the database and seven backups
 of it come to about 16 GiB — 18 while a new backup is written and the oldest
 has not gone yet — plus a write-ahead log and thirty megabytes of container
 log. Lower it on a small disk.
@@ -215,7 +221,7 @@ client does with a host key, for the same reason. No domain, no Let's Encrypt,
 works over a Tailscale address:
 
 ```bash
-docker compose exec uwussh uwussh-server fingerprint
+docker compose exec uwusync uwusync-server fingerprint
 # SHA256:ulfTn6S7NU3WLo3YpGCLPYmpbGfwIQbmvTJDOH421Ok
 ```
 
@@ -231,7 +237,7 @@ The health check says so too — it only calls the server healthy when the other
 end of its handshake holds the key in `tls/key.pem`.
 
 Already have a real certificate? `sudo bash install.sh --behind-proxy
-https://sync.example.com` sets `UWUSSH_TLS=off`, listens on `127.0.0.1` only,
+https://sync.example.com` sets `UWUSYNC_TLS=off`, listens on `127.0.0.1` only,
 and believes the last `X-Forwarded-For` address, which is the one your proxy
 adds — so the rate limits count devices, not the proxy. Caddy and nginx
 examples are in [docs/deployment.md](docs/deployment.md#behind-a-reverse-proxy).
@@ -241,7 +247,7 @@ examples are in [docs/deployment.md](docs/deployment.md#behind-a-reverse-proxy).
 ```bash
 cargo test            # unit tests, the API over real HTTP, and the real client
 cargo clippy --all-targets -- -D warnings
-docker build -f docker/Dockerfile -t uwussh-server .   # the image, from source
+docker build -f docker/Dockerfile -t uwusync-server .   # the image, from source
 ```
 
 CI does more than that on every push: it cross-builds the binaries for amd64
@@ -275,5 +281,5 @@ address, the group or the password that went in.
 
 ## Licence
 
-GPL-3.0-only, like the rest of UwUSSH. If you hand on a changed version, hand
+GPL-3.0-only, like UwUSSH and UwURDP. If you hand on a changed version, hand
 on the source too.

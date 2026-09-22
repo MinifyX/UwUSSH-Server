@@ -1,4 +1,4 @@
-//! `uwussh-server health`: the container's health check, asked from inside.
+//! `uwusync-server health`: the container's health check, asked from inside.
 //!
 //! The image has no shell and no curl, so the binary asks itself. It calls
 //! the running server where it listens, the way a device would — over the

@@ -2500,43 +2500,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "uwussh-server"
-version = "0.1.1"
-dependencies = [
- "axum",
- "axum-server",
- "base64 0.22.1",
- "clap",
- "ed25519-dalek 2.2.0",
- "futures-core",
- "hyper-util",
- "libc",
- "parking_lot",
- "rand",
- "rcgen",
- "reqwest",
- "rusqlite",
- "rustls",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 1.0.69",
- "time",
- "tokio",
- "tokio-stream",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "uwussh-proto",
- "uwussh-store",
- "uwussh-sync",
- "uwussh-vault",
- "webpki-roots",
- "zeroize",
-]
-
-[[package]]
 name = "uwussh-store"
 version = "0.1.0-beta.10"
 source = "git+https://github.com/MinifyX/UwUSSH-Client.git?rev=0671b0a840cfa9c4ea11a841acb697f620f99479#0671b0a840cfa9c4ea11a841acb697f620f99479"
@@ -2596,6 +2559,43 @@ dependencies = [
  "thiserror 1.0.69",
  "uuid",
  "uwussh-proto",
+ "zeroize",
+]
+
+[[package]]
+name = "uwusync-server"
+version = "0.1.1"
+dependencies = [
+ "axum",
+ "axum-server",
+ "base64 0.22.1",
+ "clap",
+ "ed25519-dalek 2.2.0",
+ "futures-core",
+ "hyper-util",
+ "libc",
+ "parking_lot",
+ "rand",
+ "rcgen",
+ "reqwest",
+ "rusqlite",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "uwussh-proto",
+ "uwussh-store",
+ "uwussh-sync",
+ "uwussh-vault",
+ "webpki-roots",
  "zeroize",
 ]
 

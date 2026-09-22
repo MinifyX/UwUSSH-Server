@@ -1,4 +1,4 @@
-//! `uwussh-server` — run it, or ask it something.
+//! `uwusync-server` — run it, or ask it something.
 //!
 //! With no arguments it serves. The other commands are the ones you reach for
 //! from a shell on the box: make an invite, see the devices, shut one out, take
@@ -10,13 +10,17 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::Duration;
 use uuid::Uuid;
-use uwussh_server::api;
-use uwussh_server::config::TlsMode;
-use uwussh_server::db::{accounts, devices, invites, records, Db};
-use uwussh_server::{connections, health, now_ms, tls, updates, AppState, Config};
+use uwusync_server::api;
+use uwusync_server::config::TlsMode;
+use uwusync_server::db::{accounts, devices, invites, records, Db};
+use uwusync_server::{connections, health, now_ms, tls, updates, AppState, Config};
 
 #[derive(Parser)]
-#[command(name = "uwussh-server", version, about = "Sync server for UwUSSH")]
+#[command(
+    name = "uwusync-server",
+    version,
+    about = "Sync server for UwUSSH and UwURDP"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -45,7 +49,7 @@ enum Command {
     },
     /// Put a backup back. Without a name, list the backups there are. Only
     /// while the server is stopped:
-    /// `docker compose stop && docker compose run --rm uwussh restore <name>`
+    /// `docker compose stop && docker compose run --rm uwusync restore <name>`
     Restore {
         /// A file under `backups`, or a path.
         backup: Option<PathBuf>,
@@ -71,7 +75,7 @@ fn main() -> Result<(), String> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "uwussh_server=info,tower_http=warn".into()),
+                .unwrap_or_else(|_| "uwusync_server=info,tower_http=warn".into()),
         )
         // The log goes to stderr, so what a command prints on stdout — a
         // fingerprint, a list of backups — is only that. Colours for a person
@@ -111,7 +115,7 @@ fn main() -> Result<(), String> {
                 tls::fingerprint_of(&config.data_dir, true).map_err(|error| error.to_string())?;
             println!("{fingerprint}");
             println!("A new key. Every device has to be set up again: remove the server in");
-            println!("UwUSSH under Settings → Sync and connect with a new setup code.");
+            println!("UwUSSH or UwURDP under Settings → Sync and connect with a new setup code.");
             Ok(())
         }
         Command::Serve => serve(db, config),
@@ -147,7 +151,7 @@ fn main() -> Result<(), String> {
                 .collect::<rusqlite::Result<_>>()
                 .map_err(|error| error.to_string())?;
             if rows.is_empty() {
-                println!("No accounts yet. `uwussh-server invite` makes the first one possible.");
+                println!("No accounts yet. `uwusync-server invite` makes the first one possible.");
             }
             for (id, created) in rows {
                 let account = Uuid::parse_str(&id).unwrap_or(Uuid::nil());
@@ -200,7 +204,7 @@ fn main() -> Result<(), String> {
                     println!("A device pins this on the first connection, like an SSH host key.");
                 }
                 TlsMode::Off => {
-                    println!("UWUSSH_TLS is off: the certificate belongs to whatever is in front.")
+                    println!("UWUSYNC_TLS is off: the certificate belongs to whatever is in front.")
                 }
             }
             Ok(())
@@ -248,7 +252,7 @@ async fn serve(db: Db, config: Config) -> Result<(), String> {
         // that — this line is written before anybody can connect.
         tracing::info!(
             setup_code = %setup_code(&config, &code, fingerprint.as_deref()),
-            "no accounts yet: paste this setup code into UwUSSH under Settings → Sync. It is good for a week"
+            "no accounts yet: paste this setup code into UwUSSH or UwURDP under Settings → Sync. It is good for a week"
         );
     }
 
@@ -258,7 +262,15 @@ async fn serve(db: Db, config: Config) -> Result<(), String> {
     let state = AppState::new(db, config);
     maintenance(state.clone());
     updates::spawn(state.config.clone());
-    tracing::info!(version = updates::build().version, "UwUSSH Server");
+    tracing::info!(version = updates::build().version, "UwUSync Server");
+    let legacy = uwusync_server::config::legacy_variables();
+    if !legacy.is_empty() {
+        tracing::info!(
+            variables = %legacy.join(" "),
+            "these settings still have their names from UwUSSH Server; they work, \
+             and update.sh renames them to UWUSYNC_…"
+        );
+    }
 
     // Every connection is an open file, and the server takes hundreds.
     match connections::raise_open_files() {
@@ -266,7 +278,7 @@ async fn serve(db: Db, config: Config) -> Result<(), String> {
             files,
             connections = limits.max,
             "this process may open fewer files than the server takes connections; \
-             raise the limit (ulimit -n) or lower UWUSSH_MAX_CONNECTIONS"
+             raise the limit (ulimit -n) or lower UWUSYNC_MAX_CONNECTIONS"
         ),
         _ => {}
     }
@@ -299,7 +311,7 @@ async fn serve(db: Db, config: Config) -> Result<(), String> {
     });
     match &identity {
         Some(identity) => {
-            tracing::info!(%listen, %url, fingerprint = %identity.fingerprint, "UwUSSH sync server ready")
+            tracing::info!(%listen, %url, fingerprint = %identity.fingerprint, "UwUSync server ready")
         }
         None => tracing::warn!(
             %listen, %url,
@@ -430,7 +442,7 @@ fn purge(db: &Db) {
 fn room_for_backup(config: &Config, path: &std::path::Path) -> Result<(), String> {
     let database = config.database();
     let size = |path: &std::path::Path| std::fs::metadata(path).map_or(0, |meta| meta.len());
-    let need = size(&database) + size(&database.with_file_name("uwussh.db-wal"));
+    let need = size(&database) + size(&with_suffix(&database, "-wal"));
     // The directory it goes into may not be there yet; the disk it will be
     // on is that of the nearest one that is.
     let Some((free, total)) = path.ancestors().skip(1).find_map(disk_space) else {
@@ -492,10 +504,10 @@ fn keep_newest(dir: &std::path::Path, keep: usize) {
                 && path
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("uwussh-"))
+                    .is_some_and(|name| backup_stamp(name).is_some())
         })
         .collect();
-    files.sort();
+    files.sort_by(|a, b| stamp_of(a).cmp(&stamp_of(b)));
     for old in files.iter().rev().skip(keep) {
         let _ = std::fs::remove_file(old);
     }
@@ -506,7 +518,7 @@ fn has_accounts(db: &Db) -> bool {
     accounts::count(&db.lock()).map_or(true, |count| count > 0)
 }
 
-/// `uwussh-server restore [name]`.
+/// `uwusync-server restore [name]`.
 fn restore(config: &Config, backup: Option<PathBuf>) -> Result<(), String> {
     let Some(backup) = backup else {
         let backups = list_backups(&config.backups());
@@ -525,8 +537,8 @@ fn restore(config: &Config, backup: Option<PathBuf>) -> Result<(), String> {
         backup
     };
     let database = config.database();
-    let aside = database.with_file_name(format!("uwussh.db.before-restore-{}", stamp(now_ms())));
-    uwussh_server::db::restore(&path, &database, &aside)?;
+    let aside = with_suffix(&database, &format!(".before-restore-{}", stamp(now_ms())));
+    uwusync_server::db::restore(&path, &database, &aside)?;
     println!("Restored from {}.", path.display());
     if aside.exists() {
         println!("What was there before is kept as {}.", aside.display());
@@ -544,21 +556,43 @@ fn list_backups(dir: &std::path::Path) -> Vec<(String, u64)> {
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().to_str()?.to_string();
-            (name.starts_with("uwussh-") && name.ends_with(".db"))
-                .then(|| (name, entry.metadata().map(|meta| meta.len()).unwrap_or(0)))
+            backup_stamp(&name)?;
+            let bytes = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+            Some((name, bytes))
         })
         .collect();
-    backups.sort();
+    backups.sort_by(|(a, _), (b, _)| backup_stamp(a).cmp(&backup_stamp(b)));
     backups
 }
 
-/// Where a backup goes unless told otherwise: `backups/uwussh-<when>.db`, to
+/// When a backup was written, from its name: `uwusync-<when>.db`, or
+/// `uwussh-<when>.db` from before the server was called UwUSync. Nothing for
+/// a file that is not a backup.
+fn backup_stamp(name: &str) -> Option<&str> {
+    name.strip_prefix("uwusync-")
+        .or_else(|| name.strip_prefix("uwussh-"))?
+        .strip_suffix(".db")
+}
+
+fn stamp_of(path: &std::path::Path) -> Option<&str> {
+    backup_stamp(path.file_name()?.to_str()?)
+}
+
+/// The database's name with something after it, the way SQLite names its own
+/// files next to it — whichever name the database has.
+fn with_suffix(database: &std::path::Path, suffix: &str) -> PathBuf {
+    let mut name = database.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Where a backup goes unless told otherwise: `backups/uwusync-<when>.db`, to
 /// the second — the nightly one and one taken before an update can fall on
 /// the same day, and `VACUUM INTO` will not write over a file.
 fn backup_path(config: &Config) -> PathBuf {
     config
         .backups()
-        .join(format!("uwussh-{}.db", stamp(now_ms())))
+        .join(format!("uwusync-{}.db", stamp(now_ms())))
 }
 
 /// One setup code to paste: where the server is, its certificate fingerprint,
@@ -570,7 +604,7 @@ fn setup_code(config: &Config, invite: &str, fingerprint: Option<&str>) -> Strin
     if let Some(fingerprint) = fingerprint {
         body["f"] = serde_json::json!(fingerprint);
     }
-    format!("uwu1_{}", uwussh_server::b64::encode(body.to_string()))
+    format!("uwu1_{}", uwusync_server::b64::encode(body.to_string()))
 }
 
 /// `YYYY-MM-DD` from milliseconds since the epoch, without pulling in a date
@@ -625,7 +659,7 @@ mod tests {
 
     fn decode(code: &str) -> serde_json::Value {
         assert!(code.starts_with("uwu1_"), "{code}");
-        let decoded = uwussh_server::b64::decode(&code["uwu1_".len()..]).unwrap();
+        let decoded = uwusync_server::b64::decode(&code["uwu1_".len()..]).unwrap();
         serde_json::from_slice(&decoded).unwrap()
     }
 
@@ -649,11 +683,11 @@ mod tests {
     fn without_its_own_certificate_there_is_nothing_to_pin() {
         let config = Config {
             tls: TlsMode::Off,
-            public: Some("https://uwussh.example.com".into()),
+            public: Some("https://uwusync.example.com".into()),
             ..Config::default()
         };
         let parsed = decode(&setup_code(&config, "X", None));
-        assert_eq!(parsed["u"], "https://uwussh.example.com");
+        assert_eq!(parsed["u"], "https://uwusync.example.com");
         assert!(parsed.get("f").is_none(), "{parsed}");
     }
 
@@ -681,10 +715,14 @@ mod tests {
 
     #[test]
     fn only_the_newest_backups_are_kept() {
-        let dir = std::env::temp_dir().join(format!("uwussh-backups-{}", Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("uwusync-backups-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
-        for day in 1..=5 {
+        // Two from before the new name, three after.
+        for day in 1..=2 {
             std::fs::write(dir.join(format!("uwussh-2026-09-0{day}-030000.db")), b"x").unwrap();
+        }
+        for day in 3..=5 {
+            std::fs::write(dir.join(format!("uwusync-2026-09-0{day}-030000.db")), b"x").unwrap();
         }
         std::fs::write(dir.join("notes.txt"), b"x").unwrap();
 
@@ -700,9 +738,40 @@ mod tests {
             left,
             vec![
                 "notes.txt",
-                "uwussh-2026-09-04-030000.db",
-                "uwussh-2026-09-05-030000.db"
+                "uwusync-2026-09-04-030000.db",
+                "uwusync-2026-09-05-030000.db"
             ]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn backups_from_before_the_new_name_still_count() {
+        assert_eq!(
+            backup_stamp("uwussh-2026-09-01-030000.db"),
+            Some("2026-09-01-030000")
+        );
+        assert_eq!(
+            backup_stamp("uwusync-2026-09-02-030000.db"),
+            Some("2026-09-02-030000")
+        );
+        assert_eq!(backup_stamp("notes.db"), None);
+        assert_eq!(backup_stamp("uwusync-x.txt"), None);
+        let dir = std::env::temp_dir().join(format!("uwusync-listed-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("uwusync-2026-09-22-030000.db"), b"x").unwrap();
+        std::fs::write(dir.join("uwussh-2026-09-21-030000.db"), b"x").unwrap();
+        let names: Vec<String> = list_backups(&dir)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "uwussh-2026-09-21-030000.db",
+                "uwusync-2026-09-22-030000.db"
+            ],
+            "oldest first, whatever they are called"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

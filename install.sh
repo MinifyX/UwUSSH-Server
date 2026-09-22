@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# UwUSSH Server, from an empty machine to a running sync server.
+# UwUSync Server, from an empty machine to a running sync server.
 #
-#   curl -fsSLO https://github.com/MinifyX/UwUSSH-Server/releases/latest/download/install.sh
+#   curl -fsSLO https://github.com/MinifyX/UwUSync-Server/releases/latest/download/install.sh
 #   sudo bash install.sh
 #
 # It installs Docker when it is missing, asks how your devices reach this machine, sets up
-# /opt/uwussh, starts the server and shows the setup code to paste into UwUSSH. Every answer is
-# a flag as well, so it can run without questions:
+# /opt/uwusync, starts the server and shows the setup code to paste into UwUSSH or UwURDP.
+# Every answer is a flag as well, so it can run without questions:
 #
 #   sudo bash install.sh --public nas.lan --yes
 #
-#   --dir DIR              where UwUSSH Server lives (default /opt/uwussh)
+#   --dir DIR              where UwUSync Server lives (default /opt/uwusync)
 #   --public ADDRESS       how your devices reach this machine: a name or an address, like
 #                          nas.lan, 192.168.1.20 or a Tailscale name. The port is added.
 #   --bind X               where it listens here: a port, or address:port (default 8443)
@@ -28,12 +28,12 @@
 # The whole way, with a reverse proxy, backups and updates: docs/deployment.md.
 set -uo pipefail
 
-repo=MinifyX/UwUSSH-Server
+repo=MinifyX/UwUSync-Server
 releases="https://github.com/$repo/releases"
-service=uwussh
+service=uwusync
 here="$(cd "$(dirname "$0")" && pwd)"
 
-dir=/opt/uwussh
+dir=/opt/uwusync
 public=""
 bind=""
 proxy=""
@@ -247,10 +247,14 @@ if $ask && ! have_tty; then
   die "there is no terminal to ask on. Pass --public ... --yes, or start this from a shell."
 fi
 
-printf '\n  UwUSSH Server\n  ~~~~~~~~~~~~~\n\n'
+printf '\n  UwUSync Server\n  ~~~~~~~~~~~~~\n\n'
 
 if [ -f "$dir/.env" ]; then
   die "$dir is set up already. A newer version? cd $dir && sudo bash update.sh"
+fi
+# Set up while it was called UwUSSH Server: that one moves over with its own update.sh.
+if [ "$dir" = /opt/uwusync ] && [ -f /opt/uwussh/.env ]; then
+  die "UwUSSH Server is set up in /opt/uwussh, and it is UwUSync Server now. Bring it over, with its data and devices: cd /opt/uwussh && sudo bash update.sh"
 fi
 
 # ── Docker ────────────────────────────────────────────────────────────────────────────────────
@@ -259,7 +263,7 @@ fi
 install_docker() {
   local script log
   script=$(mktemp)
-  log=$(mktemp /tmp/uwussh-docker-XXXXXX.log)
+  log=$(mktemp /tmp/uwusync-docker-XXXXXX.log)
   step "installing Docker with Docker's own script (a minute or two)"
   fetch https://get.docker.com "$script" || die "Docker's install script could not be downloaded"
   # Not from standard input: piped into bash, that is the rest of this script.
@@ -331,7 +335,7 @@ if [ -z "$bind" ]; then
       die "port 8443 is taken on this machine. Say which one to use instead: --bind <port>"
     fi
     warn "port 8443 is taken on this machine"
-    answer=$(askfor "Which port should UwUSSH Server listen on instead?" "$(free_from 8444)")
+    answer=$(askfor "Which port should UwUSync Server listen on instead?" "$(free_from 8444)")
     valid_bind "$answer" || die "that is not a port from 1 to 65535, or an address:port: $answer"
     if [ -n "$proxy" ]; then
       bind="127.0.0.1:$(port_of "$answer")"
@@ -395,17 +399,17 @@ take update.sh "$dir/update.sh"
 chmod 0755 "$dir/update.sh"
 
 install -m 0600 "$dir/.env.example" "$dir/.env"
-set_env UWUSSH_PUBLIC "$public"
-set_env UWUSSH_VERSION "$version"
-set_env UWUSSH_BIND "$bind"
-set_env UWUSSH_REGISTRATION "$registration"
-set_env UWUSSH_UPDATE_CHECK "$update_check"
+set_env UWUSYNC_PUBLIC "$public"
+set_env UWUSYNC_VERSION "$version"
+set_env UWUSYNC_BIND "$bind"
+set_env UWUSYNC_REGISTRATION "$registration"
+set_env UWUSYNC_UPDATE_CHECK "$update_check"
 if [ -n "$proxy" ]; then
-  set_env UWUSSH_TLS off
-  set_env UWUSSH_TRUST_FORWARDED on
+  set_env UWUSYNC_TLS off
+  set_env UWUSYNC_TRUST_FORWARDED on
 else
-  set_env UWUSSH_TLS auto
-  set_env UWUSSH_TRUST_FORWARDED off
+  set_env UWUSYNC_TLS auto
+  set_env UWUSYNC_TRUST_FORWARDED off
 fi
 step "wrote $dir/.env"
 
@@ -413,8 +417,8 @@ step "wrote $dir/.env"
 {
   printf '# Written by install.sh and update.sh: what they put here, so they know what they may replace.\n'
   printf 'compose %s\n' "$(hash_of "$dir/compose.yaml")"
-} >"$dir/.uwussh-update"
-chmod 0644 "$dir/.uwussh-update"
+} >"$dir/.uwusync-update"
+chmod 0644 "$dir/.uwusync-update"
 
 # ── the first start ───────────────────────────────────────────────────────────────────────────
 cd "$dir" || die "cannot go into $dir"
@@ -434,8 +438,8 @@ if $pull; then
   docker compose pull --quiet </dev/null || give_up "the image could not be fetched"
 fi
 
-step "starting UwUSSH Server"
-docker compose up -d </dev/null || give_up "UwUSSH Server did not start"
+step "starting UwUSync Server"
+docker compose up -d </dev/null || give_up "UwUSync Server did not start"
 
 printf '  waiting for the server'
 healthy=false
@@ -462,14 +466,14 @@ $healthy || give_up "the server did not come up"
 code=$(docker compose logs --no-color "$service" </dev/null 2>/dev/null |
   grep -oE 'setup_code=uwu1_[A-Za-z0-9_-]+' | head -1 | cut -d= -f2)
 if [ -z "$code" ]; then
-  code=$(docker compose exec -T "$service" uwussh-server invite </dev/null 2>/dev/null |
+  code=$(docker compose exec -T "$service" uwusync-server invite </dev/null 2>/dev/null |
     grep -oE 'uwu1_[A-Za-z0-9_-]+' | head -1)
 fi
-[ -n "$code" ] || die "the server runs, but gave no setup code. Ask for one: cd $dir && docker compose exec $service uwussh-server invite"
+[ -n "$code" ] || die "the server runs, but gave no setup code. Ask for one: cd $dir && docker compose exec $service uwusync-server invite"
 
 fingerprint=""
 if [ -z "$proxy" ]; then
-  fingerprint=$(docker compose exec -T "$service" uwussh-server fingerprint </dev/null 2>/dev/null |
+  fingerprint=$(docker compose exec -T "$service" uwusync-server fingerprint </dev/null 2>/dev/null |
     grep -oE 'SHA256:[A-Za-z0-9+/]+' | head -1)
 fi
 
@@ -477,7 +481,7 @@ address="$public"
 case "$address" in https://*) ;; *) address="https://$address" ;; esac
 
 cat <<DONE
-  UwUSSH Server is running (=^･ω･^=)
+  UwUSync Server is running (=^･ω･^=)
 
   Setup code    $code
   Address       $address
@@ -485,7 +489,7 @@ DONE
 [ -n "$fingerprint" ] && printf '  Fingerprint   %s\n' "$fingerprint"
 cat <<DONE
 
-  In UwUSSH, open Settings → Sync, paste the setup code and type your master password.
+  In UwUSSH or UwURDP, open Settings → Sync, paste the setup code and type your master password.
   The code makes one account and is good for a week; every other device joins from the
   first one, with three words it shows you.
 DONE
@@ -496,7 +500,7 @@ DONE
 PIN
 cat <<DONE
 
-  Another setup code:   cd $dir && sudo docker compose exec $service uwussh-server invite
+  Another setup code:   cd $dir && sudo docker compose exec $service uwusync-server invite
   Next version:         cd $dir && sudo bash update.sh
   What is next:         https://github.com/$repo/blob/main/docs/deployment.md
 

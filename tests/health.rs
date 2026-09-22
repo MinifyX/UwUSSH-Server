@@ -6,12 +6,12 @@ use axum_server::Handle;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use uuid::Uuid;
-use uwussh_server::config::TlsMode;
-use uwussh_server::db::Db;
-use uwussh_server::{api, connections, health, tls, AppState, Config};
+use uwusync_server::config::TlsMode;
+use uwusync_server::db::Db;
+use uwusync_server::{api, connections, health, tls, AppState, Config};
 
 fn scratch() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("uwussh-health-{}", Uuid::now_v7()));
+    let dir = std::env::temp_dir().join(format!("uwusync-health-{}", Uuid::now_v7()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }

@@ -200,7 +200,7 @@ mod tests {
             .unwrap()
             .into_response()
             .into_body();
-        // As `uwussh-server revoke` does it: the database, and no token.
+        // As `uwusync-server revoke` does it: the database, and no token.
         devices::revoke(&state.db.lock(), account, device).unwrap();
         let ended = tokio::time::timeout(RECHECK * 3, axum::body::to_bytes(body, usize::MAX)).await;
         assert!(ended.is_ok());

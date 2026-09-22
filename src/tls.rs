@@ -13,7 +13,7 @@
 //! fingerprint — and nothing a device pinned ever goes stale. Only the private
 //! key is kept, in one file, readable by nobody else.
 //!
-//! Whoever already has a real certificate sets `UWUSSH_TLS=off` and puts a
+//! Whoever already has a real certificate sets `UWUSYNC_TLS=off` and puts a
 //! reverse proxy in front instead.
 
 use base64::engine::general_purpose::STANDARD_NO_PAD;
@@ -64,7 +64,7 @@ pub fn load(data_dir: &Path, names: &[String], may_create: bool) -> io::Result<I
             return Err(io::Error::other(format!(
                 "the certificate key ({}) is gone, and this server has accounts. Every device \
                  pinned that key and would refuse a new one: put it back from a copy of the data \
-                 volume. If it is lost for good, `uwussh-server new-key` makes a new one, and \
+                 volume. If it is lost for good, `uwusync-server new-key` makes a new one, and \
                  every device has to be set up again",
                 path.display()
             )));
@@ -80,7 +80,7 @@ pub fn load(data_dir: &Path, names: &[String], may_create: bool) -> io::Result<I
 
     let mut params = CertificateParams::new(names.to_vec()).map_err(io::Error::other)?;
     let mut name = DistinguishedName::new();
-    name.push(DnType::CommonName, "UwUSSH sync server");
+    name.push(DnType::CommonName, "UwUSync server");
     params.distinguished_name = name;
     let now = time::OffsetDateTime::now_utc();
     // A little in the past, so a device whose clock runs slow still accepts it.
@@ -108,7 +108,7 @@ pub fn public_key_of(data_dir: &Path) -> io::Result<Option<Vec<u8>>> {
     }
 }
 
-/// Just the fingerprint, for `uwussh-server fingerprint` and the setup code.
+/// Just the fingerprint, for `uwusync-server fingerprint` and the setup code.
 pub fn fingerprint_of(data_dir: &Path, may_create: bool) -> io::Result<String> {
     Ok(load(data_dir, &["localhost".to_string()], may_create)?.fingerprint)
 }
@@ -192,7 +192,7 @@ mod tests {
     use uuid::Uuid;
 
     fn scratch() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("uwussh-tls-{}", Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("uwusync-tls-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -271,12 +271,12 @@ mod tests {
             vec!["localhost", "nas.lan"]
         );
         assert_eq!(
-            names_for(Some("https://uwussh.example.com")),
-            vec!["localhost", "uwussh.example.com"]
+            names_for(Some("https://uwusync.example.com")),
+            vec!["localhost", "uwusync.example.com"]
         );
         assert_eq!(
-            names_for(Some("https://uwussh.example.com/sync")),
-            vec!["localhost", "uwussh.example.com"]
+            names_for(Some("https://uwusync.example.com/sync")),
+            vec!["localhost", "uwusync.example.com"]
         );
         assert_eq!(
             names_for(Some("10.0.0.5:8443")),

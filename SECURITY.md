@@ -1,12 +1,12 @@
 # Security
 
-UwUSSH Server keeps other people's SSH hosts, keys and passwords — sealed, so it cannot read
+UwUSync Server keeps other people's SSH and RDP hosts, keys and passwords — sealed, so it cannot read
 them, but a flaw here matters all the same. Thank you for looking.
 
 ## Reporting
 
 Please report a vulnerability privately, through GitHub:
-**[Report a vulnerability](https://github.com/MinifyX/UwUSSH-Server/security/advisories/new)**.
+**[Report a vulnerability](https://github.com/MinifyX/UwUSync-Server/security/advisories/new)**.
 Not in a public issue.
 
 Say what you found, how to reproduce it, and what you think it allows. I answer within a week,
@@ -15,7 +15,7 @@ not be named.
 
 ## What is in scope
 
-- The server: this repository, and the images at `ghcr.io/minifyx/uwussh-server`.
+- The server: this repository, and the images at `ghcr.io/minifyx/uwusync-server`.
 - `install.sh` and `update.sh`, which run as root.
 - The protocol both halves speak, whose types live in the client's `uwussh-proto` crate. A flaw
   in the client itself belongs to [UwUSSH-Client](https://github.com/MinifyX/UwUSSH-Client).

@@ -119,13 +119,13 @@ pub fn restore(backup: &Path, database: &Path, aside: &Path) -> Result<(), Strin
             .map_err(found)?;
         if version < 1 || tables != 3 {
             return Err(format!(
-                "{} is not a UwUSSH Server database",
+                "{} is not a UwUSync Server database",
                 backup.display()
             ));
         }
         if version > SCHEMA_VERSION {
             return Err(format!(
-                "{} comes from a newer UwUSSH Server (schema {version}); restore it with that one",
+                "{} comes from a newer UwUSync Server (schema {version}); restore it with that one",
                 backup.display()
             ));
         }
@@ -186,7 +186,7 @@ pub fn restore(backup: &Path, database: &Path, aside: &Path) -> Result<(), Strin
     Ok(())
 }
 
-/// `uwussh.db` → `uwussh.db-<suffix>`, as SQLite names its own files.
+/// `uwusync.db` → `uwusync.db-<suffix>`, as SQLite names its own files.
 fn sibling(database: &Path, suffix: &str) -> PathBuf {
     let mut name = database.as_os_str().to_owned();
     name.push(format!("-{suffix}"));
@@ -341,7 +341,7 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         return Err(rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
             Some(format!(
-                "this database comes from a newer UwUSSH Server (schema {version}, this one knows \
+                "this database comes from a newer UwUSync Server (schema {version}, this one knows \
                  {SCHEMA_VERSION}). Run the newer version, or restore the backup from before it"
             )),
         ));
@@ -409,7 +409,7 @@ mod tests {
     }
 
     fn scratch() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("uwussh-restore-{}", uuid::Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("uwusync-restore-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -424,9 +424,9 @@ mod tests {
     #[test]
     fn a_backup_goes_back_and_what_was_there_is_kept() {
         let dir = scratch();
-        let live = dir.join("uwussh.db");
+        let live = dir.join("uwusync.db");
         let backup = dir.join("backup.db");
-        let aside = dir.join("uwussh.db.before-restore");
+        let aside = dir.join("uwusync.db.before-restore");
         {
             let db = Db::open(&live).unwrap();
             invites::create_invite(&db.lock(), 60_000).unwrap();
@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn after_a_restore_the_numbers_go_on_from_where_the_devices_are() {
         let dir = scratch();
-        let live = dir.join("uwussh.db");
+        let live = dir.join("uwusync.db");
         let backup = dir.join("backup.db");
         let account = {
             let db = Db::open(&live).unwrap();
@@ -489,7 +489,7 @@ mod tests {
     #[test]
     fn a_backup_of_a_database_on_disk_is_taken_beside_the_server_not_through_it() {
         let dir = scratch();
-        let db = Db::open(&dir.join("uwussh.db")).unwrap();
+        let db = Db::open(&dir.join("uwusync.db")).unwrap();
         invites::create_invite(&db.lock(), 60_000).unwrap();
         // Holding the shared connection, as a request in flight would: the
         // backup does not wait for it.
@@ -504,7 +504,7 @@ mod tests {
     #[test]
     fn a_database_in_use_is_not_replaced() {
         let dir = scratch();
-        let live = dir.join("uwussh.db");
+        let live = dir.join("uwusync.db");
         let backup = dir.join("backup.db");
         let running = Db::open(&live).unwrap();
         running.backup_to(&backup).unwrap();
@@ -521,21 +521,21 @@ mod tests {
     #[test]
     fn a_database_from_a_newer_server_is_not_opened() {
         let dir = scratch();
-        let path = dir.join("uwussh.db");
+        let path = dir.join("uwusync.db");
         drop(Db::open(&path).unwrap());
         Connection::open(&path)
             .unwrap()
             .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
             .unwrap();
         let error = Db::open(&path).err().expect("refused").to_string();
-        assert!(error.contains("newer UwUSSH Server"), "{error}");
+        assert!(error.contains("newer UwUSync Server"), "{error}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn the_database_is_not_its_own_backup() {
         let dir = scratch();
-        let live = dir.join("uwussh.db");
+        let live = dir.join("uwusync.db");
         drop(Db::open(&live).unwrap());
         let error = restore(&live, &live, &dir.join("aside")).unwrap_err();
         assert!(error.contains("itself"), "{error}");
@@ -546,7 +546,7 @@ mod tests {
     #[test]
     fn a_restore_leaves_no_log_of_the_old_database_behind() {
         let dir = scratch();
-        let live = dir.join("uwussh.db");
+        let live = dir.join("uwusync.db");
         let backup = dir.join("backup.db");
         {
             let db = Db::open(&live).unwrap();
@@ -564,7 +564,7 @@ mod tests {
     #[test]
     fn only_a_sound_backup_of_this_server_is_taken() {
         let dir = scratch();
-        let live = dir.join("uwussh.db");
+        let live = dir.join("uwusync.db");
         Db::open(&live).unwrap();
 
         let junk = dir.join("junk.db");
@@ -577,7 +577,7 @@ mod tests {
             .execute_batch("CREATE TABLE notes (text TEXT); PRAGMA user_version = 1;")
             .unwrap();
         let error = restore(&other, &live, &dir.join("aside")).unwrap_err();
-        assert!(error.contains("not a UwUSSH Server database"), "{error}");
+        assert!(error.contains("not a UwUSync Server database"), "{error}");
 
         let newer = dir.join("newer.db");
         Db::open(&live).unwrap().backup_to(&newer).unwrap();

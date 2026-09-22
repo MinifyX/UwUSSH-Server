@@ -29,4 +29,4 @@ jobs:
         run: |
           # A fixable HIGH or CRITICAL in the newest build means it is time to rebuild the base.
           "$RUNNER_TEMP/trivy" image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
-            --exit-code 1 --no-progress ghcr.io/minifyx/uwussh-server:edge
+            --exit-code 1 --no-progress ghcr.io/minifyx/uwusync-server:edge

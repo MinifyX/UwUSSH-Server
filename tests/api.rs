@@ -11,10 +11,10 @@ use serde_json::json;
 use std::net::SocketAddr;
 use uuid::Uuid;
 use uwussh_proto::{EntityKind, Envelope, Hlc, PullResponse, PushResponse, SCHEMA_VERSION};
-use uwussh_server::api;
-use uwussh_server::config::Registration;
-use uwussh_server::db::Db;
-use uwussh_server::{AppState, Config};
+use uwusync_server::api;
+use uwusync_server::config::Registration;
+use uwusync_server::db::Db;
+use uwusync_server::{AppState, Config};
 
 /// A server on a port of its own, with nothing on disk.
 struct Server {
@@ -65,7 +65,7 @@ impl Server {
 
     async fn invite(&self) -> String {
         let conn = self.state.db.lock();
-        uwussh_server::db::invites::create_invite(&conn, 60_000).unwrap()
+        uwusync_server::db::invites::create_invite(&conn, 60_000).unwrap()
     }
 
     /// The vault header a device uploads. Its contents are opaque here — the
@@ -100,7 +100,7 @@ fn login_key(password: &str) -> String {
     for (slot, byte) in key.iter_mut().zip(password.bytes().cycle()) {
         *slot = byte;
     }
-    uwussh_server::b64::encode(key)
+    uwusync_server::b64::encode(key)
 }
 
 impl Device {
@@ -120,7 +120,7 @@ impl Device {
                 "authKey": login_key(password),
                 "device": {
                     "name": "LVDesk1",
-                    "publicKey": uwussh_server::b64::encode(signing.verifying_key().to_bytes()),
+                    "publicKey": uwusync_server::b64::encode(signing.verifying_key().to_bytes()),
                 },
             }))
             .send()
@@ -150,8 +150,8 @@ impl Device {
             .await
             .unwrap();
         let challenge =
-            uwussh_server::b64::decode(challenge["challenge"].as_str().unwrap()).unwrap();
-        let material = uwussh_server::auth::session_material(self.account, self.id, &challenge);
+            uwusync_server::b64::decode(challenge["challenge"].as_str().unwrap()).unwrap();
+        let material = uwusync_server::auth::session_material(self.account, self.id, &challenge);
         let signature = self.signing.sign(&material).to_bytes();
 
         let response = server
@@ -159,7 +159,7 @@ impl Device {
             .post(server.url("/v1/session"))
             .json(&json!({
                 "deviceId": self.id,
-                "signature": uwussh_server::b64::encode(signature),
+                "signature": uwusync_server::b64::encode(signature),
             }))
             .send()
             .await
@@ -277,7 +277,7 @@ async fn a_second_device_joins_with_a_token_and_the_master_password() {
     assert!(params.get("wrappedBlob").is_none(), "{params}");
 
     let second_key = Device::new_key(2);
-    let second_public = uwussh_server::b64::encode(second_key.verifying_key().to_bytes());
+    let second_public = uwusync_server::b64::encode(second_key.verifying_key().to_bytes());
     let join = |password: &'static str| {
         let body = json!({
             "enrolment": token,
@@ -412,9 +412,9 @@ async fn nothing_reaches_anyone_who_did_not_sign() {
         .json()
         .await
         .unwrap();
-    let raw = uwussh_server::b64::decode(challenge["challenge"].as_str().unwrap()).unwrap();
-    let material = uwussh_server::auth::session_material(device.account, device.id, &raw);
-    let signature = uwussh_server::b64::encode(device.signing.sign(&material).to_bytes());
+    let raw = uwusync_server::b64::decode(challenge["challenge"].as_str().unwrap()).unwrap();
+    let material = uwusync_server::auth::session_material(device.account, device.id, &raw);
+    let signature = uwusync_server::b64::encode(device.signing.sign(&material).to_bytes());
     let replay = json!({ "deviceId": device.id, "signature": signature });
 
     let first = server
@@ -461,7 +461,7 @@ async fn a_revoked_device_is_out_at_once() {
             "authKey": login_key("master"),
             "device": {
                 "name": "LVLaptop",
-                "publicKey": uwussh_server::b64::encode(second_key.verifying_key().to_bytes()),
+                "publicKey": uwusync_server::b64::encode(second_key.verifying_key().to_bytes()),
             },
         }))
         .send()
@@ -548,7 +548,7 @@ async fn join(server: &Server, token: &str, password: &str, seed: u8) -> reqwest
             "authKey": login_key(password),
             "device": {
                 "name": format!("device {seed}"),
-                "publicKey": uwussh_server::b64::encode(key.verifying_key().to_bytes()),
+                "publicKey": uwusync_server::b64::encode(key.verifying_key().to_bytes()),
             },
         }))
         .send()
@@ -676,7 +676,7 @@ async fn open_registration_counts_every_account_it_makes() {
             "invite": "",
             "vault": Server::vault(Uuid::now_v7()),
             "authKey": login_key("master"),
-            "device": { "name": "x", "publicKey": uwussh_server::b64::encode([7u8; 32]) },
+            "device": { "name": "x", "publicKey": uwusync_server::b64::encode([7u8; 32]) },
         }))
         .send()
         .await
@@ -707,7 +707,7 @@ async fn a_full_server_takes_no_more_accounts_and_keeps_the_invite() {
             "invite": second,
             "vault": Server::vault(Uuid::now_v7()),
             "authKey": login_key("master"),
-            "device": { "name": "x", "publicKey": uwussh_server::b64::encode([8u8; 32]) },
+            "device": { "name": "x", "publicKey": uwusync_server::b64::encode([8u8; 32]) },
         }))
         .send()
         .await
@@ -715,7 +715,7 @@ async fn a_full_server_takes_no_more_accounts_and_keeps_the_invite() {
     assert_eq!(response.status(), 403);
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body["error"], "server-full");
-    let open = uwussh_server::db::invites::count_open_invites(&server.state.db.lock()).unwrap();
+    let open = uwusync_server::db::invites::count_open_invites(&server.state.db.lock()).unwrap();
     assert_eq!(open, 1, "the invite was not spent on a refusal");
 }
 
@@ -752,7 +752,7 @@ async fn a_push_of_several_mebibytes_gets_through() {
 async fn an_account_holds_what_the_server_allows_and_no_more() {
     let server = start_with(Config {
         registration: Registration::Open,
-        quota: uwussh_server::db::records::Quota {
+        quota: uwusync_server::db::records::Quota {
             records: 3,
             bytes: 1024 * 1024,
             ..Default::default()
@@ -833,7 +833,7 @@ async fn an_invite_lets_exactly_one_account_in() {
                 "invite": code,
                 "vault": Server::vault(Uuid::now_v7()),
                 "authKey": login_key("master"),
-                "device": { "name": "another", "publicKey": uwussh_server::b64::encode([3u8; 32]) },
+                "device": { "name": "another", "publicKey": uwusync_server::b64::encode([3u8; 32]) },
             }))
             .send()
             .await
@@ -851,7 +851,7 @@ async fn a_closed_server_takes_no_new_accounts() {
         .json(&json!({
             "vault": Server::vault(Uuid::now_v7()),
             "authKey": login_key("master"),
-            "device": { "name": "x", "publicKey": uwussh_server::b64::encode([4u8; 32]) },
+            "device": { "name": "x", "publicKey": uwusync_server::b64::encode([4u8; 32]) },
         }))
         .send()
         .await
@@ -941,7 +941,7 @@ async fn changing_the_master_password_takes_the_old_one() {
             .json(&json!({
                 "enrolment": enrolment["token"],
                 "authKey": login_key(password),
-                "device": { "name": "next", "publicKey": uwussh_server::b64::encode([5u8; 32]) },
+                "device": { "name": "next", "publicKey": uwusync_server::b64::encode([5u8; 32]) },
             }))
             .send()
     };
@@ -961,7 +961,7 @@ async fn a_vault_too_cheap_to_guess_against_is_not_taken() {
         .json(&json!({
             "vault": cheap,
             "authKey": login_key("master"),
-            "device": { "name": "x", "publicKey": uwussh_server::b64::encode([6u8; 32]) },
+            "device": { "name": "x", "publicKey": uwusync_server::b64::encode([6u8; 32]) },
         }))
         .send()
         .await
@@ -972,7 +972,7 @@ async fn a_vault_too_cheap_to_guess_against_is_not_taken() {
         "and says why"
     );
     assert_eq!(
-        uwussh_server::db::accounts::count(&server.state.db.lock()).unwrap(),
+        uwusync_server::db::accounts::count(&server.state.db.lock()).unwrap(),
         0
     );
 
@@ -1063,7 +1063,7 @@ async fn guessing_is_slowed_down() {
         let response = server
             .client
             .post(server.url("/v1/session"))
-            .json(&json!({ "deviceId": device.id, "signature": uwussh_server::b64::encode([0u8; 64]) }))
+            .json(&json!({ "deviceId": device.id, "signature": uwusync_server::b64::encode([0u8; 64]) }))
             .send()
             .await
             .unwrap();
@@ -1112,7 +1112,7 @@ async fn two_devices_hand_a_secret_through_the_relay() {
             server
                 .client
                 .post(server.url(&format!("/v1/pair/{id}")))
-                .json(&json!({ "side": side, "message": uwussh_server::b64::encode(message) })),
+                .json(&json!({ "side": side, "message": uwusync_server::b64::encode(message) })),
         )
         .send()
     };
@@ -1138,7 +1138,7 @@ async fn two_devices_hand_a_secret_through_the_relay() {
     let theirs: serde_json::Value = read("b", 0).await.unwrap().json().await.unwrap();
     assert_eq!(
         theirs["messages"][0],
-        uwussh_server::b64::encode(b"spake from a")
+        uwusync_server::b64::encode(b"spake from a")
     );
     assert_eq!(theirs["next"], 1);
 
@@ -1151,7 +1151,7 @@ async fn two_devices_hand_a_secret_through_the_relay() {
     let theirs: serde_json::Value = read("b", 1).await.unwrap().json().await.unwrap();
     assert_eq!(
         theirs["messages"][0],
-        uwussh_server::b64::encode(b"sealed account key"),
+        uwusync_server::b64::encode(b"sealed account key"),
         "and only what it has not seen yet"
     );
 
@@ -1159,7 +1159,7 @@ async fn two_devices_hand_a_secret_through_the_relay() {
     let as_a = server
         .client
         .post(server.url(&format!("/v1/pair/{id}")))
-        .json(&json!({ "side": "a", "message": uwussh_server::b64::encode(b"me too") }))
+        .json(&json!({ "side": "a", "message": uwusync_server::b64::encode(b"me too") }))
         .send()
         .await
         .unwrap();
@@ -1212,7 +1212,7 @@ async fn a_waiting_device_is_woken_when_the_other_speaks() {
             .client
             .post(server.url(&format!("/v1/pair/{id}")))
             .bearer_auth(&first.token)
-            .json(&json!({ "side": "a", "message": uwussh_server::b64::encode(b"at last") }))
+            .json(&json!({ "side": "a", "message": uwusync_server::b64::encode(b"at last") }))
             .send()
             .await
             .unwrap()
@@ -1224,7 +1224,7 @@ async fn a_waiting_device_is_woken_when_the_other_speaks() {
             .expect("the wait ends when the message arrives");
 
     let body: serde_json::Value = answer.unwrap().json().await.unwrap();
-    assert_eq!(body["messages"][0], uwussh_server::b64::encode(b"at last"));
+    assert_eq!(body["messages"][0], uwusync_server::b64::encode(b"at last"));
 }
 
 /// `tokio::join!` as a function, so both halves can be put under one timeout.
@@ -1260,7 +1260,7 @@ async fn the_relay_is_a_handshake_and_not_storage() {
     };
 
     assert_eq!(
-        post(uwussh_server::b64::encode(vec![0u8; 9 * 1024]))
+        post(uwusync_server::b64::encode(vec![0u8; 9 * 1024]))
             .await
             .unwrap()
             .status(),
@@ -1275,7 +1275,7 @@ async fn the_relay_is_a_handshake_and_not_storage() {
 
     for _ in 0..4 {
         assert_eq!(
-            post(uwussh_server::b64::encode(b"fine"))
+            post(uwusync_server::b64::encode(b"fine"))
                 .await
                 .unwrap()
                 .status(),
@@ -1283,7 +1283,7 @@ async fn the_relay_is_a_handshake_and_not_storage() {
         );
     }
     assert_eq!(
-        post(uwussh_server::b64::encode(b"one too many"))
+        post(uwusync_server::b64::encode(b"one too many"))
             .await
             .unwrap()
             .status(),
@@ -1295,7 +1295,7 @@ async fn the_relay_is_a_handshake_and_not_storage() {
     let bad_side = server
         .client
         .post(server.url(&format!("/v1/pair/{id}")))
-        .json(&json!({ "side": "c", "message": uwussh_server::b64::encode(b"x") }))
+        .json(&json!({ "side": "c", "message": uwusync_server::b64::encode(b"x") }))
         .send()
         .await
         .unwrap();

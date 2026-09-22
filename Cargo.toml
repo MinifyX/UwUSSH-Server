@@ -1,10 +1,10 @@
 [package]
-name = "uwussh-server"
-description = "Sync server for UwUSSH: an encrypted mailbox for hosts, keys and passwords"
+name = "uwusync-server"
+description = "Sync server for UwUSSH and UwURDP: an encrypted mailbox for hosts, keys and passwords"
 version = "0.1.1"
 edition = "2021"
 license = "GPL-3.0-only"
-repository = "https://github.com/MinifyX/UwUSSH-Server"
+repository = "https://github.com/MinifyX/UwUSync-Server"
 # Same floor as the client, so one protocol crate builds for both.
 rust-version = "1.89"
 

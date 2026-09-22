@@ -1,28 +1,30 @@
 # syntax=docker/dockerfile:1.7
 #
-# Packages the binaries CI built before: dist/amd64/uwussh-server and
-# dist/arm64/uwussh-server. docker/Dockerfile builds the same image from source.
+# Packages the binaries CI built before: dist/amd64/uwusync-server and
+# dist/arm64/uwusync-server. docker/Dockerfile builds the same image from source.
 
 # The preparation runs on the machine that builds, whatever the image is for: it only copies and
 # sets modes, so nothing has to be emulated. Pinned by digest, like the runtime below — this stage
 # holds the binary for a moment, and must be exactly the image that was looked at.
 FROM --platform=$BUILDPLATFORM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS prep
 ARG TARGETARCH
-COPY dist/${TARGETARCH}/uwussh-server /usr/local/bin/uwussh-server
-RUN chmod 755 /usr/local/bin/uwussh-server \
+COPY dist/${TARGETARCH}/uwusync-server /usr/local/bin/uwusync-server
+# uwussh-server is its name from when it was UwUSSH Server, for a compose.yaml or a habit from then.
+RUN chmod 755 /usr/local/bin/uwusync-server \
+ && ln -s uwusync-server /usr/local/bin/uwussh-server \
  && install -d -o 10001 -g 10001 /data
 
 # Distroless, pinned by digest: see docker/Dockerfile for why.
 FROM gcr.io/distroless/cc-debian13@sha256:4594d59540d1948417f6ca2829ddd9294493a7c68b7528f4dd459de7f203a750
-COPY --from=prep /usr/local/bin/uwussh-server /usr/local/bin/uwussh-server
+COPY --from=prep /usr/local/bin/ /usr/local/bin/
 COPY --from=prep --chown=10001:10001 /data /data
 USER 10001:10001
-ENV UWUSSH_DATA=/data \
-    UWUSSH_LISTEN=0.0.0.0:8443 \
+ENV UWUSYNC_DATA=/data \
+    UWUSYNC_LISTEN=0.0.0.0:8443 \
     HOME=/data
 VOLUME /data
 EXPOSE 8443
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --start-interval=2s --retries=3 \
-    CMD ["/usr/local/bin/uwussh-server", "health"]
-ENTRYPOINT ["/usr/local/bin/uwussh-server"]
+    CMD ["/usr/local/bin/uwusync-server", "health"]
+ENTRYPOINT ["/usr/local/bin/uwusync-server"]
 CMD ["serve"]

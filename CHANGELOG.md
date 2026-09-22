@@ -3,6 +3,34 @@
 Each release gets a section here before its tag is pushed; CI copies the section into the GitHub
 release. Versions follow semver; `-beta.N` versions are pre-releases.
 
+## Unreleased
+
+**UwUSSH Server is UwUSync Server now.** It syncs UwURDP as well as UwUSSH, so the old name had
+become too narrow. The new names:
+
+- Repository: MinifyX/UwUSync-Server. The old address forwards.
+- Image: `ghcr.io/minifyx/uwusync-server`.
+- Command: `uwusync-server`.
+- Settings: `UWUSYNC_…`.
+- New installations: `/opt/uwusync`.
+- A new icon.
+
+Nothing changes for the devices: the protocol, the setup codes and the pinned keys stay the same.
+
+- **`update.sh` moves a server from before over by itself**, in the directory it is in. It takes a
+  backup first. The settings in `.env` get their new names, the data volume stays the same one,
+  and the old container stops only once the new image is on the machine. If the new version does
+  not come up, everything from before goes back. CI tests this against a real 0.1.1 installation.
+- **The old names keep working.**
+  - The server still reads `UWUSSH_…` settings, and its log says which ones still have the old
+    name.
+  - A database called `uwussh.db` keeps that name, so a rollback still finds it.
+  - Backups called `uwussh-….db` are listed, restored and pruned like new ones.
+  - The image answers to `uwussh-server` as well. It is also published under its old name,
+    `ghcr.io/minifyx/uwussh-server`, for a `compose.yaml` kept by hand.
+- **`install.sh` stops on a machine that already has UwUSSH Server** in `/opt/uwussh`, and says
+  how to bring that one over. It no longer sets up a second server next to it.
+
 ## 0.1.1
 
 **Security fixes.** A second look at 0.1.0 found ways to wear the server down, fill its disk, or

@@ -15,13 +15,13 @@
 use std::net::SocketAddr;
 use std::sync::mpsc;
 use uwussh_proto::api::{CreateAccount, EnrolDevice, NewDevice};
-use uwussh_server::config::Registration;
-use uwussh_server::db::accounts::KdfFloor;
-use uwussh_server::db::Db;
-use uwussh_server::{api, b64, random_bytes, AppState, Config};
 use uwussh_store::{AuthMethod, HostDraft, PasswordChange, SecretText, Store};
 use uwussh_sync::{from_wire, sync_once, to_wire, Server};
 use uwussh_vault::{AccountKey, KdfParams};
+use uwusync_server::config::Registration;
+use uwusync_server::db::accounts::KdfFloor;
+use uwusync_server::db::Db;
+use uwusync_server::{api, b64, random_bytes, AppState, Config};
 
 const PASSWORD: &[u8] = b"correct horse battery staple";
 /// The cheap parameters, because these tests run on every commit and the real
@@ -345,12 +345,12 @@ fn unprotect(bytes: &[u8]) -> std::io::Result<zeroize::Zeroizing<Vec<u8>>> {
     ))
 }
 
-/// The setup code the server prints, built the way `uwussh-server invite`
+/// The setup code the server prints, built the way `uwusync-server invite`
 /// builds it.
 fn setup_code(running: &Running) -> uwussh_sync::Setup {
     let invite = {
         let conn = running.state.db.lock();
-        uwussh_server::db::invites::create_invite(&conn, 60_000).unwrap()
+        uwusync_server::db::invites::create_invite(&conn, 60_000).unwrap()
     };
     let body = serde_json::json!({ "u": running.url, "i": invite }).to_string();
     let code = format!("uwu1_{}", b64::encode(body));

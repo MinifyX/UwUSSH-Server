@@ -1,4 +1,4 @@
-//! The UwUSSH sync server.
+//! UwUSync Server: the sync server behind UwUSSH and UwURDP.
 //!
 //! It is a **dumb, encrypted mailbox**. It hands out sequence numbers, keeps
 //! the newest version of every record, pages through them from a cursor, and

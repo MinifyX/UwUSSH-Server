@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1.7
 #
-# Builds UwUSSH Server from source:
+# Builds UwUSync Server from source:
 #
-#   docker build -f docker/Dockerfile -t uwussh-server .
+#   docker build -f docker/Dockerfile -t uwusync-server .
 #
 # CI uses docker/Dockerfile.release instead, with binaries it cross-compiled
 # before, which is much faster for arm64. Both end in the same image.
@@ -19,13 +19,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     touch src/main.rs src/lib.rs \
  && cargo build --release --locked \
- && cp target/release/uwussh-server /usr/local/bin/uwussh-server
+ && cp target/release/uwusync-server /usr/local/bin/uwusync-server
 
 # Debian still has the tools distroless does not: make /data, owned by the user
 # the server runs as.
 FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS prep
-COPY --from=build /usr/local/bin/uwussh-server /usr/local/bin/uwussh-server
-RUN chmod 755 /usr/local/bin/uwussh-server \
+COPY --from=build /usr/local/bin/uwusync-server /usr/local/bin/uwusync-server
+# uwussh-server is its name from when it was UwUSSH Server, for a compose.yaml or a habit from then.
+RUN chmod 755 /usr/local/bin/uwusync-server \
+ && ln -s uwusync-server /usr/local/bin/uwussh-server \
  && install -d -o 10001 -g 10001 /data
 
 # The runtime is distroless: glibc and not much else — no shell, no package
@@ -34,17 +36,17 @@ RUN chmod 755 /usr/local/bin/uwussh-server \
 # port above 1024 and writes one directory, so it needs no capability at all
 # and no root.
 FROM gcr.io/distroless/cc-debian13@sha256:4594d59540d1948417f6ca2829ddd9294493a7c68b7528f4dd459de7f203a750
-COPY --from=prep /usr/local/bin/uwussh-server /usr/local/bin/uwussh-server
+COPY --from=prep /usr/local/bin/ /usr/local/bin/
 COPY --from=prep --chown=10001:10001 /data /data
 USER 10001:10001
-ENV UWUSSH_DATA=/data \
-    UWUSSH_LISTEN=0.0.0.0:8443 \
+ENV UWUSYNC_DATA=/data \
+    UWUSYNC_LISTEN=0.0.0.0:8443 \
     HOME=/data
 VOLUME /data
 EXPOSE 8443
 # No curl in here, so the server asks itself — over its own TLS, and only
 # healthy when the other end holds this server's key.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --start-interval=2s --retries=3 \
-    CMD ["/usr/local/bin/uwussh-server", "health"]
-ENTRYPOINT ["/usr/local/bin/uwussh-server"]
+    CMD ["/usr/local/bin/uwusync-server", "health"]
+ENTRYPOINT ["/usr/local/bin/uwusync-server"]
 CMD ["serve"]

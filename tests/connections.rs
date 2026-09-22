@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use uwussh_server::connections::{serve, Limits};
+use uwusync_server::connections::{serve, Limits};
 
 const DEADLINE: Duration = Duration::from_millis(300);
 

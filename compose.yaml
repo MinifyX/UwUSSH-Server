@@ -1,42 +1,42 @@
-# UwUSSH Server
+# UwUSync Server
 #
 # install.sh sets all of this up for you. By hand it is:
 #
-#   1. cp .env.example .env   and set UWUSSH_PUBLIC to how your devices reach this machine
+#   1. cp .env.example .env   and set UWUSYNC_PUBLIC to how your devices reach this machine
 #   2. docker compose up -d
-#   3. docker compose logs uwussh | grep uwu1_
-#   4. paste that setup code into UwUSSH under Settings → Sync
+#   3. docker compose logs uwusync | grep uwu1_
+#   4. paste that setup code into UwUSSH or UwURDP under Settings → Sync
 #
 # The next version: update.sh, next to this file. Everything that differs from one machine to
 # the next lives in .env, so update.sh can put the next version's compose.yaml here.
 #
 # The whole story, with a reverse proxy, backups and updates: docs/deployment.md.
 
-name: uwussh
+name: uwusync
 
 services:
-  uwussh:
-    image: ghcr.io/minifyx/uwussh-server:${UWUSSH_VERSION:-latest}
-    container_name: uwussh
+  uwusync:
+    image: ghcr.io/minifyx/uwusync-server:${UWUSYNC_VERSION:-latest}
+    container_name: uwusync
     restart: unless-stopped
     environment:
-      UWUSSH_PUBLIC: ${UWUSSH_PUBLIC:?set UWUSSH_PUBLIC in .env}
-      UWUSSH_REGISTRATION: ${UWUSSH_REGISTRATION:-invite}
-      UWUSSH_TLS: ${UWUSSH_TLS:-auto}
-      UWUSSH_TRUST_FORWARDED: ${UWUSSH_TRUST_FORWARDED:-off}
-      UWUSSH_UPDATE_CHECK: ${UWUSSH_UPDATE_CHECK:-on}
-      UWUSSH_MAX_ACCOUNTS: ${UWUSSH_MAX_ACCOUNTS:-100}
-      UWUSSH_ACCOUNT_MAX_RECORDS: ${UWUSSH_ACCOUNT_MAX_RECORDS:-100000}
-      UWUSSH_ACCOUNT_MAX_MB: ${UWUSSH_ACCOUNT_MAX_MB:-256}
-      UWUSSH_SERVER_MAX_MB: ${UWUSSH_SERVER_MAX_MB:-2048}
-      UWUSSH_MAX_CONNECTIONS: ${UWUSSH_MAX_CONNECTIONS:-512}
-      UWUSSH_MAX_CONNECTIONS_PER_IP: ${UWUSSH_MAX_CONNECTIONS_PER_IP:-32}
+      UWUSYNC_PUBLIC: ${UWUSYNC_PUBLIC:?set UWUSYNC_PUBLIC in .env}
+      UWUSYNC_REGISTRATION: ${UWUSYNC_REGISTRATION:-invite}
+      UWUSYNC_TLS: ${UWUSYNC_TLS:-auto}
+      UWUSYNC_TRUST_FORWARDED: ${UWUSYNC_TRUST_FORWARDED:-off}
+      UWUSYNC_UPDATE_CHECK: ${UWUSYNC_UPDATE_CHECK:-on}
+      UWUSYNC_MAX_ACCOUNTS: ${UWUSYNC_MAX_ACCOUNTS:-100}
+      UWUSYNC_ACCOUNT_MAX_RECORDS: ${UWUSYNC_ACCOUNT_MAX_RECORDS:-100000}
+      UWUSYNC_ACCOUNT_MAX_MB: ${UWUSYNC_ACCOUNT_MAX_MB:-256}
+      UWUSYNC_SERVER_MAX_MB: ${UWUSYNC_SERVER_MAX_MB:-2048}
+      UWUSYNC_MAX_CONNECTIONS: ${UWUSYNC_MAX_CONNECTIONS:-512}
+      UWUSYNC_MAX_CONNECTIONS_PER_IP: ${UWUSYNC_MAX_CONNECTIONS_PER_IP:-32}
       # What counts as an update is what this machine follows.
-      UWUSSH_CHANNEL: ${UWUSSH_VERSION:-latest}
+      UWUSYNC_CHANNEL: ${UWUSYNC_VERSION:-latest}
     ports:
-      - "${UWUSSH_BIND:-8443}:8443"   # the devices, over the server's own TLS
+      - "${UWUSYNC_BIND:-8443}:8443"   # the devices, over the server's own TLS
     volumes:
-      - uwussh-data:/data
+      - uwusync-data:/data
     stop_grace_period: 10s
     # Docker keeps a container's log for ever unless told otherwise, and somebody knocking a few
     # hundred times a second writes a lot of it. Thirty megabytes, then the oldest goes.
@@ -57,4 +57,7 @@ services:
       - no-new-privileges:true
 
 volumes:
-  uwussh-data:
+  uwusync-data:
+    # A server set up while it was UwUSSH Server keeps the volume it has: update.sh writes its
+    # name, uwussh_uwussh-data, into .env as UWUSYNC_VOLUME. Everybody else gets the usual one.
+    name: ${UWUSYNC_VOLUME:-uwusync_uwusync-data}
