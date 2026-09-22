@@ -31,7 +31,6 @@ image=ghcr.io/minifyx/uwusync-server
 service=uwusync
 sync_service=$service
 # The same server under the name it had before: UwUSSH Server.
-legacy_repo=MinifyX/UwUSSH-Server
 legacy_image=ghcr.io/minifyx/uwussh-server
 legacy_service=uwussh
 # Where this script is — when it is a file at all. Piped into bash, $0 is "bash", and "here"
@@ -628,11 +627,13 @@ chmod 0644 "$state"
 # Its name from before is not needed any more once the move went through.
 $migrating && rm -f "$dir/.uwussh-update"
 
-# The image from before has no name any more; only ours, and only those, go — under either name.
-for source in "$repo" "$legacy_repo"; do
-  docker image prune -f --filter "label=org.opencontainers.image.source=https://github.com/$source" \
-    >/dev/null 2>&1 || true
-done
+# The image from before has no name any more; only ours, and only those, go.
+docker image prune -f --filter "label=org.opencontainers.image.source=https://github.com/$repo" \
+  >/dev/null 2>&1 || true
+# After a move the old image still has its old name, so it goes by what it is instead.
+if $migrating && [ -n "$running_image" ]; then
+  docker image rm "$running_image" >/dev/null 2>&1 || true
+fi
 
 new_version=$(docker inspect "$service" \
   --format '{{index .Config.Labels "org.opencontainers.image.version"}}' 2>/dev/null)
