@@ -57,8 +57,11 @@ pub const HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 const H2_PING_EVERY: Duration = Duration::from_secs(30);
 const H2_PING_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Requests in flight on one HTTP/2 connection. A device needs a handful.
-const H2_STREAMS: u32 = 64;
+/// Requests in flight on one HTTP/2 connection. The apps speak HTTP/1.1, one
+/// request at a time; a browser or a proxy speaking HTTP/2 needs a handful.
+/// Every one of them may hold a body being read, so what one address can keep
+/// the server busy with is this many times the connections it may open.
+const H2_STREAMS: u32 = 8;
 
 /// Before hyper's own deadline can start, the connection has to say which
 /// HTTP it speaks, and hyper waits for that without a clock: up to the 24

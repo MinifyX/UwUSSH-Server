@@ -298,3 +298,29 @@ async fn an_idle_http2_connection_is_closed_after_its_last_answer() {
     );
     drop(sender);
 }
+
+#[tokio::test]
+async fn an_http2_connection_takes_only_a_few_requests_at_once() {
+    let address = start(limits()).await;
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    // The preface and an empty SETTINGS frame: enough for the server to say
+    // its own settings, which come first.
+    stream
+        .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00")
+        .await
+        .unwrap();
+    let mut header = [0u8; 9];
+    stream.read_exact(&mut header).await.unwrap();
+    assert_eq!(header[3], 0x4, "a SETTINGS frame");
+    let length = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+    let mut settings = vec![0u8; length];
+    stream.read_exact(&mut settings).await.unwrap();
+    // SETTINGS_MAX_CONCURRENT_STREAMS is setting 3.
+    let streams = settings
+        .as_chunks::<6>()
+        .0
+        .iter()
+        .find(|setting| u16::from_be_bytes([setting[0], setting[1]]) == 0x3)
+        .map(|setting| u32::from_be_bytes([setting[2], setting[3], setting[4], setting[5]]));
+    assert_eq!(streams, Some(8), "a handful, not the 64 from before");
+}
