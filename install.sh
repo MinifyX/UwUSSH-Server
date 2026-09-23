@@ -181,9 +181,14 @@ take() {
 
 hash_of() { sha256sum "$1" | cut -d' ' -f1; }
 
+# A value on its way into the .env has to be one line of plain characters. The answers are checked
+# for that below already; this is the same check update.sh makes, so the two cannot drift apart.
+plain_value() { case "${1:-}" in "" | *[!a-zA-Z0-9.:_/+\[\]-]*) return 1 ;; *) return 0 ;; esac; }
+
 # Writes one line of the .env, whether it is in there already, commented out, or missing.
 set_env() {
   local key="$1" value="$2" file="$dir/.env" line found=false tmp="$dir/.env.tmp"
+  plain_value "$value" || die "$key would become something odd, so nothing was written: $value"
   install -m 0600 /dev/null "$tmp"
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
