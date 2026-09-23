@@ -27,6 +27,11 @@ pub async fn create(
     peer: Peer,
     request: Request,
 ) -> Result<Json<Admitted>> {
+    // A closed server has nothing to count: every attempt gets the same no,
+    // and none of them takes room in the limiter.
+    if state.config.registration == Registration::Closed {
+        return Err(ApiError::RegistrationClosed);
+    }
     // Counted whether it works or not: with open registration every attempt
     // works, and a limit that forgives success would be no limit there.
     let who = who(&state, &headers, peer);

@@ -883,18 +883,22 @@ async fn an_invite_lets_exactly_one_account_in() {
 #[tokio::test]
 async fn a_closed_server_takes_no_new_accounts() {
     let server = start(Registration::Closed).await;
-    let response = server
-        .client
-        .post(server.url("/v1/accounts"))
-        .json(&json!({
-            "vault": Server::vault(Uuid::now_v7()),
-            "authKey": login_key("master"),
-            "device": { "name": "x", "publicKey": uwusync_server::b64::encode([4u8; 32]) },
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 403);
+    // The same answer every time, and none of them counted: a closed server
+    // has nothing to slow down, and nothing to fill its limiter with.
+    for _ in 0..=uwusync_server::limits::ACCOUNTS.max {
+        let response = server
+            .client
+            .post(server.url("/v1/accounts"))
+            .json(&json!({
+                "vault": Server::vault(Uuid::now_v7()),
+                "authKey": login_key("master"),
+                "device": { "name": "x", "publicKey": uwusync_server::b64::encode([4u8; 32]) },
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
+    }
 }
 
 #[tokio::test]
