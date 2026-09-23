@@ -89,6 +89,7 @@ fn check(account: &Account, envelope: &Envelope) -> Result<()> {
 ///
 /// The whole batch is one transaction: a push either happens or does not, so a
 /// device never has to wonder which half of it landed.
+#[cfg(test)]
 pub fn push(
     conn: &mut Connection,
     account: &Account,
@@ -325,6 +326,7 @@ fn row_to_envelope(account: &Account, row: &rusqlite::Row<'_>) -> rusqlite::Resu
     })
 }
 
+#[cfg(test)]
 pub fn count(conn: &Connection, account: &Account) -> rusqlite::Result<i64> {
     conn.query_row(
         "SELECT count(*) FROM records WHERE account_id = ?1",

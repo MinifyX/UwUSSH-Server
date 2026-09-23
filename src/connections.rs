@@ -208,6 +208,7 @@ impl Gate {
     }
 
     /// How many connections are open.
+    #[cfg(test)]
     pub fn open(&self) -> usize {
         self.open.lock().all
     }

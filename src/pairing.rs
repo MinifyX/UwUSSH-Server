@@ -241,12 +241,14 @@ impl Pairings {
         before - inner.len()
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         let mut inner = self.inner.lock();
         inner.retain(|_, session| session.expires_ms > now_ms());
         inner.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
