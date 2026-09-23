@@ -3,6 +3,35 @@
 Each release gets a section here before its tag is pushed; CI copies the section into the GitHub
 release. Versions follow semver; `-beta.N` versions are pre-releases.
 
+## 0.2.1
+
+**Security fixes.** A third look, this time at 0.2.0, found four more ways to wear the server down
+— none that let anybody read a record, sign in as someone else or reach another account. All four
+are fixed, each with a test. The whole round is in
+[docs/security-review-2026-09.md](docs/security-review-2026-09.md).
+
+- **Idle connections close, HTTP/2 ones too.** A connection with nothing to answer for fifteen
+  seconds is closed, whichever HTTP it speaks. Before, an HTTP/2 connection that answered the
+  pings stayed open for good, so a handful of addresses could take every connection slot. One
+  HTTP/2 connection now carries 8 requests at a time instead of 64. An event stream being
+  answered still counts as busy.
+- **Limits are counted before a body is read.** Creating an account, joining, pairing and pushing
+  are counted first, so a request that is over its limit no longer gets its body buffered.
+- **One account has at most four pulls and four pushes going at once**, each counted until its
+  answer has been sent, not just until it was started. The apps sync one request at a time and
+  never get near that.
+- **Signing in is counted per device**, and only loosely per address. Behind Docker's proxy every
+  IPv6 client shows up as one address, and one of them could lock all the others out.
+  [docs/deployment.md](docs/deployment.md) now explains how to give IPv6 clients their own
+  address.
+- **The limiter tables cannot be filled to lock others out.** Every limit has a table of its own;
+  when one is full, a newcomer is counted under its network instead of being refused, and signing
+  in is never refused for want of room. With registration closed, creating an account is refused
+  before anything is counted.
+
+`.env` is kept out of git and out of the image build, and the README says what the connection
+limits really cover.
+
 ## 0.2.0
 
 **UwUSSH Server is UwUSync Server now.** It syncs UwURDP as well as UwUSSH, so the old name had
@@ -48,7 +77,7 @@ test.
   own open-file limit as far as the system allows.
   *Correction, September 2026:* the fifteen seconds for an idle connection held for HTTP/1.1
   only. An HTTP/2 connection that answered the pings stayed open for as long as it liked, up to
-  and including 0.2.0. The release after 0.2.0 closes both kinds.
+  and including 0.2.0. 0.2.1 closes both kinds.
 - **The disk cannot be filled through the backups.** The quota was per account, and fourteen
   nightly backups each copied all of it. Now all accounts together hold at most
   `UWUSSH_SERVER_MAX_MB` (2 GiB by default), seven backups are kept instead of fourteen, and a
