@@ -9,13 +9,9 @@
 //! and both can only be redeemed once.
 
 use crate::db::constant_time_eq;
-use crate::{now_ms, random_bytes, sha256};
+use crate::{now_ms, random_bytes, sha256, CODE_ALPHABET as ALPHABET};
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
-
-/// Crockford's alphabet without the letters that look like digits: a code gets
-/// read aloud and typed in.
-const ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTVWXYZ23456789";
 
 /// Fifteen characters from thirty, in three groups: about 73 bits, which no
 /// rate-limited guesser will ever walk through.

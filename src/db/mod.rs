@@ -156,7 +156,7 @@ pub fn restore(backup: &Path, database: &Path, aside: &Path) -> Result<(), Strin
     // so it is one consistent file, and numbered on — and only then swapped
     // in. Until the last step the database is where it was; a copy that fails
     // halfway, on a full disk say, leaves it alone.
-    let incoming = sibling(database, "restoring");
+    let incoming = with_suffix(database, "-restoring");
     let _ = std::fs::remove_file(&incoming);
     let prepared = Connection::open_with_flags(backup, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .and_then(|conn| {
@@ -180,16 +180,18 @@ pub fn restore(backup: &Path, database: &Path, aside: &Path) -> Result<(), Strin
     }
     // A log beside the database belongs to the one that was there; the backup
     // must never have it played over it.
-    for leftover in ["wal", "shm"] {
-        let _ = std::fs::remove_file(sibling(database, leftover));
+    for leftover in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(with_suffix(database, leftover));
     }
     Ok(())
 }
 
-/// `uwusync.db` → `uwusync.db-<suffix>`, as SQLite names its own files.
-fn sibling(database: &Path, suffix: &str) -> PathBuf {
+/// The database's name with something after it, the way SQLite names its own
+/// files next to it — whichever name the database has: `uwusync.db` and
+/// `-wal` make `uwusync.db-wal`.
+pub fn with_suffix(database: &Path, suffix: &str) -> PathBuf {
     let mut name = database.as_os_str().to_owned();
-    name.push(format!("-{suffix}"));
+    name.push(suffix);
     PathBuf::from(name)
 }
 
@@ -553,10 +555,10 @@ mod tests {
             db.backup_to(&backup).unwrap();
         }
         // A log left from a server that was killed.
-        std::fs::write(sibling(&live, "wal"), b"not this database's").unwrap();
+        std::fs::write(with_suffix(&live, "-wal"), b"not this database's").unwrap();
         restore(&backup, &live, &dir.join("aside")).unwrap();
-        assert!(!sibling(&live, "wal").exists());
-        assert!(!sibling(&live, "restoring").exists());
+        assert!(!with_suffix(&live, "-wal").exists());
+        assert!(!with_suffix(&live, "-restoring").exists());
         assert_eq!(invites(&live), 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }

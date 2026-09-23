@@ -14,7 +14,7 @@ use crate::db::{accounts, devices, invites};
 use crate::limits;
 use crate::state::AppState;
 use crate::{ApiError, Result};
-use axum::extract::State;
+use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 
@@ -25,12 +25,18 @@ pub async fn create(
     State(state): State<AppState>,
     headers: HeaderMap,
     peer: Peer,
-    Json(request): Json<CreateAccount>,
+    request: Request,
 ) -> Result<Json<Admitted>> {
+    // A closed server has nothing to count: every attempt gets the same no,
+    // and none of them takes room in the limiter.
+    if state.config.registration == Registration::Closed {
+        return Err(ApiError::RegistrationClosed);
+    }
     // Counted whether it works or not: with open registration every attempt
     // works, and a limit that forgives success would be no limit there.
     let who = who(&state, &headers, peer);
     state.limits.check(&who, &limits::ACCOUNTS)?;
+    let request: CreateAccount = super::body(&state, request).await?;
 
     if !plausible(&request.vault) {
         return Err(ApiError::Invalid(
@@ -102,10 +108,11 @@ pub async fn vault_params(
     State(state): State<AppState>,
     headers: HeaderMap,
     peer: Peer,
-    Json(request): Json<VaultParamsRequest>,
+    request: Request,
 ) -> Result<Json<VaultParams>> {
     let who = who(&state, &headers, peer);
     state.limits.check(&who, &limits::ENROL)?;
+    let request: VaultParamsRequest = super::body(&state, request).await?;
 
     let conn = state.db.lock();
     let account =

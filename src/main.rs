@@ -12,7 +12,7 @@ use std::time::Duration;
 use uuid::Uuid;
 use uwusync_server::api;
 use uwusync_server::config::TlsMode;
-use uwusync_server::db::{accounts, devices, invites, records, Db};
+use uwusync_server::db::{accounts, devices, invites, records, with_suffix, Db};
 use uwusync_server::{connections, health, now_ms, tls, updates, AppState, Config};
 
 #[derive(Parser)]
@@ -576,14 +576,6 @@ fn backup_stamp(name: &str) -> Option<&str> {
 
 fn stamp_of(path: &std::path::Path) -> Option<&str> {
     backup_stamp(path.file_name()?.to_str()?)
-}
-
-/// The database's name with something after it, the way SQLite names its own
-/// files next to it — whichever name the database has.
-fn with_suffix(database: &std::path::Path, suffix: &str) -> PathBuf {
-    let mut name = database.as_os_str().to_owned();
-    name.push(suffix);
-    PathBuf::from(name)
 }
 
 /// Where a backup goes unless told otherwise: `backups/uwusync-<when>.db`, to

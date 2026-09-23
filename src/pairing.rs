@@ -19,7 +19,7 @@
 //!   handshake, not a file transfer, and nobody gets to use it as one.
 
 use crate::db::constant_time_eq;
-use crate::{now_ms, random_bytes, sha256, ApiError, Result};
+use crate::{now_ms, random_bytes, sha256, ApiError, Result, CODE_ALPHABET as ALPHABET};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -50,9 +50,6 @@ pub const OPEN_AT_MOST: usize = 1_000;
 
 /// The longest claim side `b` may hold its side with.
 const MAX_CLAIM_BYTES: usize = 128;
-
-/// The alphabet a code is read aloud in: no letters that look like digits.
-const ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTVWXYZ23456789";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
@@ -244,12 +241,14 @@ impl Pairings {
         before - inner.len()
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         let mut inner = self.inner.lock();
         inner.retain(|_, session| session.expires_ms > now_ms());
         inner.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

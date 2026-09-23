@@ -136,6 +136,32 @@ Changing it later is one line in `.env` and `docker compose up -d`. Devices
 that are in already keep the address they were given, so change it in the app
 on each of them as well.
 
+### IPv6 and Docker
+
+The stock `compose.yaml` publishes the port on the machine's IPv4 and IPv6
+addresses, but the network Compose makes for the container has no IPv6. So
+Docker's own proxy takes every IPv6 connection and passes it on from the
+network's gateway: to the server, **all IPv6 clients look like one address**.
+They then share what one address may do — 32 connections, and the counts for
+making an account, joining and pairing. Signing in is counted per device, so
+that is not shared. IPv4 clients keep their own address.
+
+On a home network or a tailnet that hardly matters. On a server anybody can
+reach over IPv6, one stranger can use up what all your IPv6 devices share.
+Two ways out:
+
+- **Publish on IPv4 only**, when your devices reach the machine over IPv4
+  anyway: `UWUSYNC_BIND=0.0.0.0:8443` in `.env` (or `--bind 0.0.0.0:8443` when
+  installing), then `docker compose up -d`. A client that finds the IPv6
+  address closed tries the IPv4 one.
+- **Give Docker IPv6**, so the addresses stay real: an IPv6 network for the
+  project, with Docker's `ip6tables` on — or `"userland-proxy": false` in
+  Docker's `daemon.json`, which on a machine without IPv6 networks stops
+  publishing on IPv6 at all. Both are Docker's configuration, not this
+  server's. `compose.yaml` does not ask for IPv6 itself: on a Docker without
+  IPv6 address pools such a network does not come up, and an existing one
+  would have to be made anew — an update must not stop a running server.
+
 ## Behind a reverse proxy
 
 When you already have Caddy, nginx or Traefik with a real certificate for a

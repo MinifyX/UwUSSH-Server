@@ -749,6 +749,44 @@ async fn a_push_of_several_mebibytes_gets_through() {
 }
 
 #[tokio::test]
+async fn a_request_over_its_limit_is_turned_away_before_its_body_is_read() {
+    let server = start(Registration::Open).await;
+    let device = Device::create_account(&server, "", "master", 1).await;
+    for seed in 2..=5 {
+        Device::create_account(&server, "", "master", seed).await;
+    }
+    // Five accounts this hour from this address. The sixth request is refused
+    // for that, not for what its body says: the body is never read.
+    let response = server
+        .client
+        .post(server.url("/v1/accounts"))
+        .header("content-type", "application/json")
+        .body("not even json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 429);
+
+    // The same for pushes, whose bodies may be 16 MiB: a push that is one
+    // too many is counted before it is read, whatever it holds.
+    let mut statuses = Vec::new();
+    for _ in 0..=uwusync_server::limits::PUSH.max {
+        let response = server
+            .client
+            .post(server.url("/v1/records"))
+            .bearer_auth(&device.token)
+            .header("content-type", "application/json")
+            .body("not even json")
+            .send()
+            .await
+            .unwrap();
+        statuses.push(response.status());
+    }
+    assert_eq!(statuses[0], 400, "read and refused for what it says");
+    assert_eq!(statuses.last().copied().unwrap(), 429);
+}
+
+#[tokio::test]
 async fn an_account_holds_what_the_server_allows_and_no_more() {
     let server = start_with(Config {
         registration: Registration::Open,
@@ -845,18 +883,22 @@ async fn an_invite_lets_exactly_one_account_in() {
 #[tokio::test]
 async fn a_closed_server_takes_no_new_accounts() {
     let server = start(Registration::Closed).await;
-    let response = server
-        .client
-        .post(server.url("/v1/accounts"))
-        .json(&json!({
-            "vault": Server::vault(Uuid::now_v7()),
-            "authKey": login_key("master"),
-            "device": { "name": "x", "publicKey": uwusync_server::b64::encode([4u8; 32]) },
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 403);
+    // The same answer every time, and none of them counted: a closed server
+    // has nothing to slow down, and nothing to fill its limiter with.
+    for _ in 0..=uwusync_server::limits::ACCOUNTS.max {
+        let response = server
+            .client
+            .post(server.url("/v1/accounts"))
+            .json(&json!({
+                "vault": Server::vault(Uuid::now_v7()),
+                "authKey": login_key("master"),
+                "device": { "name": "x", "publicKey": uwusync_server::b64::encode([4u8; 32]) },
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
+    }
 }
 
 #[tokio::test]
@@ -1073,6 +1115,59 @@ async fn guessing_is_slowed_down() {
         }
     }
     assert!(refused, "a guesser must run into a wall");
+}
+
+#[tokio::test]
+async fn asking_for_made_up_devices_does_not_lock_out_the_real_ones() {
+    let server = start(Registration::Open).await;
+    let mut device = Device::create_account(&server, "", "master", 1).await;
+    // From the very address the device signs in from, as every IPv6 client
+    // does behind Docker's proxy: more challenges than a device may ask for
+    // in a minute, each for a device that is not there.
+    for _ in 0..=uwusync_server::limits::SESSION.max {
+        let response = server
+            .client
+            .post(server.url("/v1/session/challenge"))
+            .json(&json!({ "deviceId": Uuid::new_v4() }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+    }
+    assert_eq!(device.login(&server).await, 200);
+}
+
+#[tokio::test]
+async fn a_device_cannot_be_kept_from_signing_in_from_elsewhere() {
+    let server = start_with(Config {
+        registration: Registration::Open,
+        trust_forwarded: true,
+        ..Config::default()
+    })
+    .await;
+    let mut device = Device::create_account(&server, "", "master", 1).await;
+    // Somebody who knows the device's id uses up every try it has — at the
+    // address they ask from.
+    let mut refused = false;
+    for _ in 0..=uwusync_server::limits::SESSION.max {
+        let response = server
+            .client
+            .post(server.url("/v1/session"))
+            .header("x-forwarded-for", "192.0.2.66")
+            .json(&json!({ "deviceId": device.id, "signature": uwusync_server::b64::encode([0u8; 64]) }))
+            .send()
+            .await
+            .unwrap();
+        if response.status() == 429 {
+            refused = true;
+        }
+    }
+    assert!(refused);
+    assert_eq!(
+        device.login(&server).await,
+        200,
+        "the device itself, from its own address"
+    );
 }
 
 // ── Pairing ──────────────────────────────────────────────────────────────────

@@ -54,6 +54,11 @@ pub mod b64 {
     }
 }
 
+/// The alphabet invite codes and pairing codes are written in: Crockford's
+/// without the letters that look like digits, because a code gets read aloud
+/// and typed in.
+pub(crate) const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTVWXYZ23456789";
+
 /// Random bytes from the operating system.
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     use rand::RngCore;

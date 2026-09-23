@@ -9,6 +9,8 @@ use axum::body::Body;
 use axum::routing::get;
 use axum::Router;
 use axum_server::Handle;
+use hyper::client::conn::http2::SendRequest;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -231,4 +233,94 @@ async fn everybody_together_holds_only_so_many_connections() {
     assert!(ask(&mut second, "/").await.contains("hello"));
     let mut third = TcpStream::connect(address).await.unwrap();
     assert!(closed_within(&mut third, Duration::from_secs(2)).await);
+}
+
+// ── HTTP/2 ──────────────────────────────────────────────────────────────────
+//
+// hyper has no idle deadline for HTTP/2: a client that has said hello and
+// answers every ping looks alive to it. What closes one is the count of what
+// the connection is answering.
+
+/// An HTTP/2 connection without TLS, the way a client that knows the server
+/// speaks it opens one. The client answers pings by itself.
+async fn h2(
+    address: SocketAddr,
+) -> (
+    SendRequest<String>,
+    tokio::task::JoinHandle<Result<(), hyper::Error>>,
+) {
+    let stream = TcpStream::connect(address).await.unwrap();
+    let (sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+            .await
+            .unwrap();
+    (sender, tokio::spawn(connection))
+}
+
+#[tokio::test]
+async fn an_idle_http2_connection_is_closed() {
+    let address = start(limits()).await;
+    let (sender, connection) = h2(address).await;
+    assert!(
+        tokio::time::timeout(DEADLINE * 10, connection)
+            .await
+            .is_ok(),
+        "still open with nothing to answer"
+    );
+    drop(sender);
+}
+
+#[tokio::test]
+async fn an_idle_http2_connection_is_closed_after_its_last_answer() {
+    let address = start(limits()).await;
+    let (mut sender, connection) = h2(address).await;
+
+    // Three deadlines long, and the connection says nothing all the while:
+    // an answer in progress keeps it.
+    let request = hyper::Request::get(format!("http://{address}/stream"))
+        .body(String::new())
+        .unwrap();
+    let response = sender.send_request(request).await.unwrap();
+    let streamed = axum::body::to_bytes(Body::new(response.into_body()), usize::MAX)
+        .await
+        .unwrap();
+    let streamed = String::from_utf8_lossy(&streamed);
+    assert!(
+        streamed.contains("tick 0") && streamed.contains("tick 5"),
+        "{streamed}"
+    );
+
+    assert!(
+        tokio::time::timeout(DEADLINE * 10, connection)
+            .await
+            .is_ok(),
+        "still open after the answer was done"
+    );
+    drop(sender);
+}
+
+#[tokio::test]
+async fn an_http2_connection_takes_only_a_few_requests_at_once() {
+    let address = start(limits()).await;
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    // The preface and an empty SETTINGS frame: enough for the server to say
+    // its own settings, which come first.
+    stream
+        .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00")
+        .await
+        .unwrap();
+    let mut header = [0u8; 9];
+    stream.read_exact(&mut header).await.unwrap();
+    assert_eq!(header[3], 0x4, "a SETTINGS frame");
+    let length = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+    let mut settings = vec![0u8; length];
+    stream.read_exact(&mut settings).await.unwrap();
+    // SETTINGS_MAX_CONCURRENT_STREAMS is setting 3.
+    let streams = settings
+        .as_chunks::<6>()
+        .0
+        .iter()
+        .find(|setting| u16::from_be_bytes([setting[0], setting[1]]) == 0x3)
+        .map(|setting| u32::from_be_bytes([setting[2], setting[3], setting[4], setting[5]]));
+    assert_eq!(streams, Some(8), "a handful, not the 64 from before");
 }

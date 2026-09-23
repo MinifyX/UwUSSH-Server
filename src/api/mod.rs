@@ -11,11 +11,12 @@ use crate::db;
 use crate::limits;
 use crate::state::{client_key, AppState};
 use crate::{b64, ApiError, Result};
-use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequest, FromRequestParts, Request};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -28,10 +29,13 @@ use tower_http::trace::TraceLayer;
 /// JSON; anything above this is a mistake or someone filling the disk.
 pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
-/// Everything else: a vault header, a device key, a pairing message. Read in
-/// full before anything is checked, so it is kept small — most of these
-/// requests come from nobody the server knows yet.
+/// Everything else: a vault header, a device key, a pairing message. Kept
+/// small — most of these requests come from nobody the server knows yet.
 pub const SMALL_BODY_BYTES: usize = 64 * 1024;
+
+/// Signing in: a device id and a signature. Its count is per device, so the
+/// body has to be read before it can be counted — which is why it is tiny.
+pub const TINY_BODY_BYTES: usize = 4 * 1024;
 
 /// How long any request may take, from the first byte to the last. Long
 /// enough for a full push over a slow uplink; short enough that a connection
@@ -46,8 +50,14 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/vault", get(accounts::vault))
         .route("/v1/vault/params", post(accounts::vault_params))
         .route("/v1/vault/key", put(accounts::change_password))
-        .route("/v1/session/challenge", post(session::challenge))
-        .route("/v1/session", post(session::login))
+        .route(
+            "/v1/session/challenge",
+            post(session::challenge).layer(DefaultBodyLimit::max(TINY_BODY_BYTES)),
+        )
+        .route(
+            "/v1/session",
+            post(session::login).layer(DefaultBodyLimit::max(TINY_BODY_BYTES)),
+        )
         .route(
             "/v1/records",
             get(records::pull)
@@ -159,4 +169,15 @@ impl<S: Send + Sync> FromRequestParts<S> for Peer {
 /// Who is knocking, for the rate limiter.
 pub fn who(state: &AppState, headers: &HeaderMap, peer: Peer) -> String {
     client_key(&state.config, headers, peer.0)
+}
+
+/// The body of a request, as JSON — read only when this is called. A handler
+/// takes the whole request instead of `Json` for this, so its limits are
+/// counted before a byte of the body is: otherwise every request somebody is
+/// not allowed to make would still be read in full first, as many at once as
+/// the connections let them send. A body that does not fit is refused the
+/// way the `Json` extractor refuses it.
+pub async fn body<T: DeserializeOwned>(state: &AppState, request: Request) -> Result<T> {
+    let Json(body) = Json::<T>::from_request(request, state).await?;
+    Ok(body)
 }

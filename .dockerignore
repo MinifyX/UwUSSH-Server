@@ -4,3 +4,4 @@ data
 .github
 docs
 *.md
+.env*

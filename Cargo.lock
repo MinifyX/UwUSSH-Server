@@ -2291,7 +2291,6 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
- "tokio-util",
 ]
 
 [[package]]
@@ -2564,7 +2563,7 @@ dependencies = [
 
 [[package]]
 name = "uwusync-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "axum-server",
@@ -2572,6 +2571,8 @@ dependencies = [
  "clap",
  "ed25519-dalek 2.2.0",
  "futures-core",
+ "http-body",
+ "hyper",
  "hyper-util",
  "libc",
  "parking_lot",
@@ -2588,6 +2589,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tower-http",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
  "uuid",

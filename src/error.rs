@@ -6,6 +6,7 @@
 //! server that answers differently is a server that answers questions nobody
 //! asked.
 
+use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -40,6 +41,10 @@ pub enum ApiError {
     Database(#[from] rusqlite::Error),
     #[error("{0}")]
     Internal(String),
+    /// A body that is not what the endpoint takes, read after its limits were
+    /// checked — answered the way axum's own extractor answers it.
+    #[error("{0}")]
+    Body(#[from] JsonRejection),
 }
 
 #[derive(Serialize)]
@@ -63,12 +68,16 @@ impl ApiError {
             Self::Database(_) | Self::Internal(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal")
             }
+            Self::Body(rejection) => (rejection.status(), "invalid"),
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if let Self::Body(rejection) = self {
+            return rejection.into_response();
+        }
         let (status, error) = self.code();
         // What went wrong inside stays inside: it goes to the log, and the
         // client gets the kind of error, not the detail.
