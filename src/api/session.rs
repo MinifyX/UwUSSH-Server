@@ -3,6 +3,18 @@
 //! The server never learns anything it could be robbed of. The device's key
 //! stays on the device, the challenge is used once, and the token lives in
 //! memory for an hour.
+//!
+//! Signing in is counted **per device**, at the address it asks from, and
+//! only loosely per address. Nobody forges an Ed25519 signature by trying
+//! again, so a tight count per address protects nothing — and an address can
+//! be shared by many devices: a household behind one router, a carrier's NAT,
+//! or every IPv6 client of a Docker host whose network has no IPv6, which all
+//! arrive from the same bridge gateway. With the count per address, one of
+//! them asking for challenges kept every other one from signing in. The
+//! device id comes with its address in the count, so somebody who knows a
+//! device's id cannot use up that device's tries from elsewhere; and every id
+//! is counted the same whether there is such a device or not, so the count
+//! does not tell which ids exist.
 
 use super::{who, Peer};
 use crate::auth::{session_material, verify_signature};
@@ -10,11 +22,17 @@ use crate::db::devices;
 use crate::limits;
 use crate::state::AppState;
 use crate::{b64, random_bytes, ApiError, Result};
-use axum::extract::State;
+use axum::extract::{Request, State};
 use axum::http::HeaderMap;
 use axum::Json;
+use uuid::Uuid;
 
 pub use uwussh_proto::api::{ChallengeRequest, ChallengeResponse, LoginRequest, LoginResponse};
+
+/// What signing in as `device` from `who` is counted as.
+fn device_at(device: Uuid, who: &str) -> String {
+    format!("device:{device}@{who}")
+}
 
 /// Something to sign.
 ///
@@ -25,10 +43,13 @@ pub async fn challenge(
     State(state): State<AppState>,
     headers: HeaderMap,
     peer: Peer,
-    Json(request): Json<ChallengeRequest>,
+    request: Request,
 ) -> Result<Json<ChallengeResponse>> {
     let who = who(&state, &headers, peer);
-    state.limits.check(&who, &limits::SESSION)?;
+    state.limits.check(&who, &limits::SIGN_IN)?;
+    let request: ChallengeRequest = super::body(&state, request).await?;
+    let device_at = device_at(request.device_id, &who);
+    state.limits.check(&device_at, &limits::SESSION)?;
 
     let known = {
         let conn = state.db.lock();
@@ -48,10 +69,13 @@ pub async fn login(
     State(state): State<AppState>,
     headers: HeaderMap,
     peer: Peer,
-    Json(request): Json<LoginRequest>,
+    request: Request,
 ) -> Result<Json<LoginResponse>> {
     let who = who(&state, &headers, peer);
-    state.limits.check(&who, &limits::SESSION)?;
+    state.limits.check(&who, &limits::SIGN_IN)?;
+    let request: LoginRequest = super::body(&state, request).await?;
+    let device_at = device_at(request.device_id, &who);
+    state.limits.check(&device_at, &limits::SESSION)?;
 
     let signature = b64::decode(&request.signature).ok_or(ApiError::Unauthorized)?;
     let device = {
@@ -80,7 +104,8 @@ pub async fn login(
         return Err(ApiError::Unauthorized);
     };
 
-    state.limits.forgive(&who, &limits::SESSION);
+    state.limits.forgive(&device_at, &limits::SESSION);
+    state.limits.forgive(&who, &limits::SIGN_IN);
     let (token, expires_ms) = state.sessions.issue(
         device.account_id,
         device.id,

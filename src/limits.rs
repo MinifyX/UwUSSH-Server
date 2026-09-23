@@ -1,8 +1,9 @@
 //! How often somebody may try.
 //!
 //! Two kinds of counting. **Per address**, where guessing would pay: creating
-//! an account, answering a challenge, joining with an enrolment token, the
-//! pairing relay. And **per account or device**, where one account holder
+//! an account, joining with an enrolment token, the pairing relay — and,
+//! loosely, signing in, which is counted per device at an address as well
+//! (see [`crate::api::session`]). And **per account or device**, where one account holder
 //! could make the server work for nobody else: pushing and pulling, making
 //! tokens, opening pairing sessions, and proving the master password, which is
 //! a guess too when the one proving it is not the owner. Pushes and pulls are
@@ -50,12 +51,23 @@ pub const ACCOUNTS: Bucket = Bucket {
     when_full: WhenFull::Coarsen,
 };
 
-/// Signing in. Nobody forges an Ed25519 signature by trying again, so this
-/// is not about guessing; it keeps the requests in bounds, and it is never
-/// what keeps a device from signing in when the table is full.
+/// Signing in as one device, from one address. Nobody forges an Ed25519
+/// signature by trying again, so this is not about guessing; it keeps the
+/// requests in bounds, and it is never what keeps a device from signing in
+/// when the table is full.
 pub const SESSION: Bucket = Bucket {
     name: "session",
     max: 30,
+    window: Duration::from_secs(60),
+    when_full: WhenFull::Admit,
+};
+
+/// Signing in from one address, whichever device: loose, because an address
+/// can be a whole household, a carrier's NAT, or a Docker bridge that every
+/// IPv6 client comes through. It only bounds how much one address can ask.
+pub const SIGN_IN: Bucket = Bucket {
+    name: "sign-in",
+    max: 300,
     window: Duration::from_secs(60),
     when_full: WhenFull::Admit,
 };

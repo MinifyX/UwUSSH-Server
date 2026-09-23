@@ -1117,6 +1117,59 @@ async fn guessing_is_slowed_down() {
     assert!(refused, "a guesser must run into a wall");
 }
 
+#[tokio::test]
+async fn asking_for_made_up_devices_does_not_lock_out_the_real_ones() {
+    let server = start(Registration::Open).await;
+    let mut device = Device::create_account(&server, "", "master", 1).await;
+    // From the very address the device signs in from, as every IPv6 client
+    // does behind Docker's proxy: more challenges than a device may ask for
+    // in a minute, each for a device that is not there.
+    for _ in 0..=uwusync_server::limits::SESSION.max {
+        let response = server
+            .client
+            .post(server.url("/v1/session/challenge"))
+            .json(&json!({ "deviceId": Uuid::new_v4() }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+    }
+    assert_eq!(device.login(&server).await, 200);
+}
+
+#[tokio::test]
+async fn a_device_cannot_be_kept_from_signing_in_from_elsewhere() {
+    let server = start_with(Config {
+        registration: Registration::Open,
+        trust_forwarded: true,
+        ..Config::default()
+    })
+    .await;
+    let mut device = Device::create_account(&server, "", "master", 1).await;
+    // Somebody who knows the device's id uses up every try it has — at the
+    // address they ask from.
+    let mut refused = false;
+    for _ in 0..=uwusync_server::limits::SESSION.max {
+        let response = server
+            .client
+            .post(server.url("/v1/session"))
+            .header("x-forwarded-for", "192.0.2.66")
+            .json(&json!({ "deviceId": device.id, "signature": uwusync_server::b64::encode([0u8; 64]) }))
+            .send()
+            .await
+            .unwrap();
+        if response.status() == 429 {
+            refused = true;
+        }
+    }
+    assert!(refused);
+    assert_eq!(
+        device.login(&server).await,
+        200,
+        "the device itself, from its own address"
+    );
+}
+
 // ── Pairing ──────────────────────────────────────────────────────────────────
 //
 // The server carries messages between two devices and understands none of

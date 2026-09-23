@@ -33,6 +33,10 @@ pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// small — most of these requests come from nobody the server knows yet.
 pub const SMALL_BODY_BYTES: usize = 64 * 1024;
 
+/// Signing in: a device id and a signature. Its count is per device, so the
+/// body has to be read before it can be counted — which is why it is tiny.
+pub const TINY_BODY_BYTES: usize = 4 * 1024;
+
 /// How long any request may take, from the first byte to the last. Long
 /// enough for a full push over a slow uplink; short enough that a connection
 /// trickling its body in cannot hold on for ever. The event stream is the one
@@ -46,8 +50,14 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/vault", get(accounts::vault))
         .route("/v1/vault/params", post(accounts::vault_params))
         .route("/v1/vault/key", put(accounts::change_password))
-        .route("/v1/session/challenge", post(session::challenge))
-        .route("/v1/session", post(session::login))
+        .route(
+            "/v1/session/challenge",
+            post(session::challenge).layer(DefaultBodyLimit::max(TINY_BODY_BYTES)),
+        )
+        .route(
+            "/v1/session",
+            post(session::login).layer(DefaultBodyLimit::max(TINY_BODY_BYTES)),
+        )
         .route(
             "/v1/records",
             get(records::pull)
