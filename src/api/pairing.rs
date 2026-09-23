@@ -18,7 +18,7 @@ use crate::limits;
 use crate::pairing::{self, Side};
 use crate::state::AppState;
 use crate::{b64, ApiError, Result};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Deserialize;
@@ -64,10 +64,11 @@ pub async fn post(
     headers: HeaderMap,
     peer: Peer,
     Path(id): Path<String>,
-    Json(request): Json<PostMessage>,
+    request: Request,
 ) -> Result<StatusCode> {
     let who = who(&state, &headers, peer);
     state.limits.check(&who, &limits::PAIR)?;
+    let request: PostMessage = super::body(&state, request).await?;
 
     let side = Side::parse(&request.side).ok_or_else(|| ApiError::Invalid("a side".into()))?;
     admit(&state, &headers, &id, side)?;

@@ -13,7 +13,7 @@ use crate::db::{accounts, devices, invites};
 use crate::limits;
 use crate::state::AppState;
 use crate::{ApiError, Result};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use uuid::Uuid;
@@ -49,10 +49,11 @@ pub async fn enrol(
     State(state): State<AppState>,
     headers: HeaderMap,
     peer: Peer,
-    Json(request): Json<EnrolRequest>,
+    request: Request,
 ) -> Result<Json<Admitted>> {
     let who = who(&state, &headers, peer);
     state.limits.check(&who, &limits::ENROL)?;
+    let request: EnrolRequest = super::body(&state, request).await?;
 
     let key = auth_key(&request.auth_key)?;
     let device_key = device_key(&request.device)?;

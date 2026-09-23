@@ -5,7 +5,7 @@ use crate::db::{devices, records};
 use crate::limits;
 use crate::state::AppState;
 use crate::{ApiError, Result};
-use axum::extract::{Query, State};
+use axum::extract::{Query, Request, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::Json;
 use futures_core::Stream;
@@ -54,13 +54,14 @@ pub async fn pull(
     Ok(Json(page))
 }
 
-/// Offer records.
+/// Offer records. Counted before the body is read: it may be 16 MiB.
 pub async fn push(
     auth: Authenticated,
     State(state): State<AppState>,
-    Json(request): Json<PushRequest>,
+    request: Request,
 ) -> Result<Json<PushResponse>> {
     state.limits.check_account(auth.account.id, &limits::PUSH)?;
+    let request: PushRequest = super::body(&state, request).await?;
     if request.schema != SCHEMA_VERSION {
         return Err(ApiError::Schema {
             found: request.schema,

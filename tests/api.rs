@@ -749,6 +749,44 @@ async fn a_push_of_several_mebibytes_gets_through() {
 }
 
 #[tokio::test]
+async fn a_request_over_its_limit_is_turned_away_before_its_body_is_read() {
+    let server = start(Registration::Open).await;
+    let device = Device::create_account(&server, "", "master", 1).await;
+    for seed in 2..=5 {
+        Device::create_account(&server, "", "master", seed).await;
+    }
+    // Five accounts this hour from this address. The sixth request is refused
+    // for that, not for what its body says: the body is never read.
+    let response = server
+        .client
+        .post(server.url("/v1/accounts"))
+        .header("content-type", "application/json")
+        .body("not even json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 429);
+
+    // The same for pushes, whose bodies may be 16 MiB: a push that is one
+    // too many is counted before it is read, whatever it holds.
+    let mut statuses = Vec::new();
+    for _ in 0..=uwusync_server::limits::PUSH.max {
+        let response = server
+            .client
+            .post(server.url("/v1/records"))
+            .bearer_auth(&device.token)
+            .header("content-type", "application/json")
+            .body("not even json")
+            .send()
+            .await
+            .unwrap();
+        statuses.push(response.status());
+    }
+    assert_eq!(statuses[0], 400, "read and refused for what it says");
+    assert_eq!(statuses.last().copied().unwrap(), 429);
+}
+
+#[tokio::test]
 async fn an_account_holds_what_the_server_allows_and_no_more() {
     let server = start_with(Config {
         registration: Registration::Open,
