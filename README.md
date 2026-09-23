@@ -202,11 +202,14 @@ Limits it enforces without a key: 500 records or 8 MiB per request and per
 page, 256 KiB per record, what one account may hold and what all of them
 together may, a handful of small messages per pairing, 64 KiB for every other
 request, two minutes for any of them — and rate limits per address where
-guessing would pay, and per account where one account could wear the server
-down for everybody else. Before a request is even read: fifteen seconds for
-its headers, fifteen for a connection that sits idle between two, 512
-connections at once and 32 from one address. An event stream that is being
-answered is none of those, and stays open.
+guessing would pay, per device for signing in, and per account where one
+account could wear the server down for everybody else, four pulls and four
+pushes at once among them. Where it can, a limit is counted before the body of
+a request is read. Before a request is even read: fifteen seconds for its headers, fifteen
+for a connection with nothing to answer (HTTP/1.1 and HTTP/2 alike), eight
+requests at once on one HTTP/2 connection, 512 connections at once and 32
+from one address. An event stream that is being answered is none of those,
+and stays open.
 
 A vault header has to ask for a key derivation that costs at least 19 MiB and
 two passes of Argon2id, or the account is not made — the client uses 64 MiB

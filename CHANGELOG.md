@@ -46,6 +46,9 @@ test.
   one address (`UWUSSH_MAX_CONNECTIONS`, `UWUSSH_MAX_CONNECTIONS_PER_IP`; behind a proxy only the
   total counts). An event stream being answered is left alone. On Linux the server also raises its
   own open-file limit as far as the system allows.
+  *Correction, September 2026:* the fifteen seconds for an idle connection held for HTTP/1.1
+  only. An HTTP/2 connection that answered the pings stayed open for as long as it liked, up to
+  and including 0.2.0. The release after 0.2.0 closes both kinds.
 - **The disk cannot be filled through the backups.** The quota was per account, and fourteen
   nightly backups each copied all of it. Now all accounts together hold at most
   `UWUSSH_SERVER_MAX_MB` (2 GiB by default), seven backups are kept instead of fourteen, and a
