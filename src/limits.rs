@@ -5,7 +5,9 @@
 //! pairing relay. And **per account or device**, where one account holder
 //! could make the server work for nobody else: pushing and pulling, making
 //! tokens, opening pairing sessions, and proving the master password, which is
-//! a guess too when the one proving it is not the owner.
+//! a guess too when the one proving it is not the owner. Pushes and pulls are
+//! also counted **at once**, per account: how many a minute says nothing about
+//! how many are held in memory at the same time.
 //!
 //! The counters live in memory. A restart forgets them, which is the right
 //! trade for a homelab server: the alternative is a write to disk for every
@@ -87,6 +89,30 @@ pub const PROOF: Bucket = Bucket {
     window: Duration::from_secs(60 * 60),
 };
 
+// ── At once, per account ────────────────────────────────────────────────────
+
+/// Requests of one kind one account may have going at the same time. A
+/// bucket says how many a minute; this says how many are held in memory at
+/// once — a page of records is up to 11 MiB of JSON, and it stays in memory
+/// until the client has read it, which a client that never reads decides.
+pub struct AtOnce {
+    pub name: &'static str,
+    pub max: usize,
+}
+
+/// A device pulls one page after the other; this is room for a few devices
+/// of one account pulling at the same moment.
+pub const PULLS: AtOnce = AtOnce {
+    name: "pulls",
+    max: 4,
+};
+
+/// The same for pushes, each of which may be 16 MiB while it is read.
+pub const PUSHES: AtOnce = AtOnce {
+    name: "pushes",
+    max: 4,
+};
+
 /// How many addresses the limiter remembers at most. Beyond that, somebody is
 /// making up addresses faster than they fall out of their windows, and a new
 /// one is refused rather than remembered — memory stays bounded. Accounts and
@@ -143,6 +169,8 @@ struct Hits {
 #[derive(Clone)]
 pub struct RateLimiter {
     inner: Arc<Mutex<Hits>>,
+    /// What each account has going right now, by kind.
+    going: Arc<Mutex<HashMap<(Uuid, &'static str), usize>>>,
 }
 
 impl Default for RateLimiter {
@@ -154,11 +182,47 @@ impl Default for RateLimiter {
                 swept: Instant::now(),
                 said_full: None,
             })),
+            going: Arc::default(),
+        }
+    }
+}
+
+/// One request an account has going, until this is dropped.
+pub struct Going {
+    going: Arc<Mutex<HashMap<(Uuid, &'static str), usize>>>,
+    key: (Uuid, &'static str),
+}
+
+impl Drop for Going {
+    fn drop(&mut self) {
+        let mut going = self.going.lock();
+        if let Some(count) = going.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                going.remove(&self.key);
+            }
         }
     }
 }
 
 impl RateLimiter {
+    /// Room for one more request of this kind from `account`, or none. The
+    /// room is taken until what comes back is dropped.
+    pub fn start(&self, account: Uuid, kind: &AtOnce) -> Result<Going> {
+        let key = (account, kind.name);
+        let mut going = self.going.lock();
+        let count = going.entry(key).or_default();
+        if *count >= kind.max {
+            tracing::debug!(%account, kind = kind.name, "too many at once");
+            return Err(ApiError::RateLimited);
+        }
+        *count += 1;
+        Ok(Going {
+            going: self.going.clone(),
+            key,
+        })
+    }
+
     /// Count this attempt from an address, and say whether it is one too many.
     pub fn check(&self, who: &str, bucket: &Bucket) -> Result<()> {
         self.count(who, bucket, true)
@@ -386,5 +450,32 @@ mod tests {
             "the ones whose short window ended made room"
         );
         assert_eq!(limiter.addresses(), 1);
+    }
+
+    #[test]
+    fn an_account_has_only_so_many_going_at_once() {
+        let limiter = RateLimiter::default();
+        let account = Uuid::now_v7();
+        let going: Vec<_> = (0..PULLS.max)
+            .map(|_| limiter.start(account, &PULLS).expect("room"))
+            .collect();
+        assert!(matches!(
+            limiter.start(account, &PULLS),
+            Err(ApiError::RateLimited)
+        ));
+        assert!(
+            limiter.start(account, &PUSHES).is_ok(),
+            "pushes are counted apart"
+        );
+        assert!(
+            limiter.start(Uuid::now_v7(), &PULLS).is_ok(),
+            "and other accounts"
+        );
+        drop(going);
+        assert!(
+            limiter.start(account, &PULLS).is_ok(),
+            "done ones make room"
+        );
+        assert!(limiter.going.lock().is_empty(), "nothing left over");
     }
 }

@@ -1,12 +1,15 @@
 //! The mailbox: take records, hand records back, and say when there is news.
 
 use crate::auth::Authenticated;
+use crate::connections::Holding;
 use crate::db::{devices, records};
 use crate::limits;
 use crate::state::AppState;
 use crate::{ApiError, Result};
+use axum::body::Body;
 use axum::extract::{Query, Request, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures_core::Stream;
 use serde::Deserialize;
@@ -14,7 +17,7 @@ use std::convert::Infallible;
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
 use tokio_stream::wrappers::ReceiverStream;
-use uwussh_proto::{PullResponse, PushRequest, PushResponse, MAX_BATCH, SCHEMA_VERSION};
+use uwussh_proto::{PushRequest, PushResponse, MAX_BATCH, SCHEMA_VERSION};
 
 #[derive(Debug, Deserialize)]
 pub struct PullQuery {
@@ -32,26 +35,37 @@ pub struct PullQuery {
 /// Everything after a cursor. The device's own records come back too — it
 /// costs one pass and lets a device check that what the server stored is what
 /// it sent.
+///
+/// A page is up to 11 MiB, and it is held until the client has read it — so
+/// it counts as one of the account's pulls until then, not only until it is
+/// made.
 pub async fn pull(
     auth: Authenticated,
     State(state): State<AppState>,
     Query(query): Query<PullQuery>,
-) -> Result<Json<PullResponse>> {
+) -> Result<Response> {
     state.limits.check_account(auth.account.id, &limits::PULL)?;
+    let going = state.limits.start(auth.account.id, &limits::PULLS)?;
     let limit = query.limit.unwrap_or(MAX_BATCH).min(MAX_BATCH);
-    let conn = state.db.lock();
-    let page = records::pull(
-        &conn,
-        &auth.account,
-        query.since,
-        limit,
-        query.manifests != 0,
-    )?;
-    // How far this device has read decides what the server may forget — so
-    // never further than there is: a device with a cursor from another server,
-    // or from before a restore, must not let tombstones go it never saw.
-    devices::seen(&conn, auth.device.id, page.cursor.0.min(auth.account.seq))?;
-    Ok(Json(page))
+    let page = {
+        let conn = state.db.lock();
+        let page = records::pull(
+            &conn,
+            &auth.account,
+            query.since,
+            limit,
+            query.manifests != 0,
+        )?;
+        // How far this device has read decides what the server may forget —
+        // so never further than there is: a device with a cursor from another
+        // server, or from before a restore, must not let tombstones go it
+        // never saw.
+        devices::seen(&conn, auth.device.id, page.cursor.0.min(auth.account.seq))?;
+        page
+    };
+    Ok(Json(page)
+        .into_response()
+        .map(|body| Body::new(Holding::new(body, going))))
 }
 
 /// Offer records. Counted before the body is read: it may be 16 MiB.
@@ -61,6 +75,7 @@ pub async fn push(
     request: Request,
 ) -> Result<Json<PushResponse>> {
     state.limits.check_account(auth.account.id, &limits::PUSH)?;
+    let _going = state.limits.start(auth.account.id, &limits::PUSHES)?;
     let request: PushRequest = super::body(&state, request).await?;
     if request.schema != SCHEMA_VERSION {
         return Err(ApiError::Schema {
@@ -219,5 +234,36 @@ mod tests {
             .into_body();
         let ended = tokio::time::timeout(RECHECK * 5, axum::body::to_bytes(body, usize::MAX)).await;
         assert!(ended.is_err(), "still open after several looks");
+    }
+
+    #[tokio::test]
+    async fn a_page_counts_as_a_pull_until_it_has_been_read() {
+        let state = AppState::new(Db::open_in_memory().unwrap(), Config::default());
+        let (_, headers) = signed_in(&state);
+        let ask = || {
+            let auth = authenticate(&state, &headers).unwrap();
+            let query = PullQuery {
+                since: 0,
+                limit: None,
+                manifests: 1,
+            };
+            pull(auth, State(state.clone()), Query(query))
+        };
+
+        // Answered, and never read: each one is still held.
+        let mut unread = Vec::new();
+        for _ in 0..limits::PULLS.max {
+            unread.push(ask().await.unwrap().into_body());
+        }
+        assert!(matches!(ask().await, Err(ApiError::RateLimited)));
+
+        // One read to its end makes room, and so does one given up on.
+        axum::body::to_bytes(unread.pop().unwrap(), usize::MAX)
+            .await
+            .unwrap();
+        let another = ask().await.unwrap();
+        assert!(matches!(ask().await, Err(ApiError::RateLimited)));
+        drop(another);
+        assert!(ask().await.is_ok());
     }
 }
