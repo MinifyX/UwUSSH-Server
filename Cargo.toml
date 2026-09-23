@@ -40,6 +40,10 @@ axum-server = { version = "0.8.0", default-features = false, features = ["tls-ru
 # The same hyper-util axum-server builds on, for its clock and its builder: what a
 # connection may take before it has said what it wants.
 hyper-util = { version = "0.1.18", features = ["tokio", "server-auto"] }
+# The traits hyper and axum already build on, to count what a connection is
+# answering until the last byte of the answer.
+http-body = "1"
+tower-service = "0.3"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 time = { version = "0.3.55", default-features = false, features = ["std"] }
 # Two clients, both on rustls with `ring` and a TLS configuration of their own:
@@ -63,6 +67,8 @@ uwussh-vault = { git = "https://github.com/MinifyX/UwUSSH-Client.git", rev = "06
 zeroize = "1.9.0"
 # Time that runs on by itself, for what waits half a minute.
 tokio = { version = "1", features = ["test-util"] }
+# An HTTP/2 client that answers pings by itself, for what an idle one gets.
+hyper = { version = "1", features = ["client", "http2"] }
 
 [profile.release]
 codegen-units = 1

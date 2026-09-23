@@ -7,18 +7,27 @@
 //! request, holds a socket and a task for as long as it likes unless something
 //! closes it — and a few thousand of those are a server nobody else reaches.
 //! So hyper gets a clock and a deadline for the headers, a connection that has
-//! not yet said which HTTP it speaks gets a deadline of its own, and there are
-//! only so many connections at once: in all, and from any one address.
+//! not yet said which HTTP it speaks gets a deadline of its own, a connection
+//! with nothing to answer is closed once it has had nothing for as long, and
+//! there are only so many connections at once: in all, and from any one
+//! address.
+//!
+//! Idle connections are counted here and not left to hyper, because hyper
+//! only knows about them for HTTP/1.1. An HTTP/2 connection that has said
+//! hello and then answers every ping is, to hyper, alive for as long as it
+//! likes.
 //!
 //! What is being answered is never cut short by any of this. An event stream
 //! says nothing for minutes on end and that is fine: the deadlines are for
 //! reading a request, not for serving one.
 
 use crate::config::Config;
+use axum::http::{Request, Response};
 use axum::Router;
 use axum_server::accept::{Accept, DefaultAcceptor};
 use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
 use axum_server::Handle;
+use http_body::{Body, Frame, SizeHint};
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
 use parking_lot::Mutex;
@@ -28,20 +37,23 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::Sleep;
+use tower_service::Service;
 
-/// How long a client has for the headers of a request, and how long an idle
-/// connection is kept between two. Plenty for a phone on a bad link; a
-/// connection that needs longer is not a device syncing.
+/// How long a client has for the headers of a request, and how long a
+/// connection is kept that has nothing to answer, HTTP/1.1 or HTTP/2. Plenty
+/// for a phone on a bad link; a connection that needs longer is not a device
+/// syncing.
 pub const HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// HTTP/2 has no header deadline — a request's headers arrive in one frame —
-/// but a connection can go quiet for good. A ping every half minute finds
-/// out, and one not answered within twenty seconds ends it.
+/// but a connection can go quiet for good, in the middle of an answer too. A
+/// ping every half minute finds out, and one not answered within twenty
+/// seconds ends it.
 const H2_PING_EVERY: Duration = Duration::from_secs(30);
 const H2_PING_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -62,7 +74,8 @@ pub struct Limits {
     pub max: usize,
     /// Open at once from one address; zero for no limit.
     pub per_address: usize,
-    /// For the headers of a request, and for a connection to start one.
+    /// For the headers of a request, for a connection to start one, and for
+    /// a connection that has nothing to answer before it is closed.
     pub header_timeout: Duration,
 }
 
@@ -224,7 +237,7 @@ struct Limited<A> {
     gate: Gate,
 }
 
-type Accepted<S, T> = Pin<Box<dyn Future<Output = io::Result<(Guarded<S>, T)>> + Send>>;
+type Accepted<S, T> = Pin<Box<dyn Future<Output = io::Result<(Guarded<S>, Tracked<T>)>> + Send>>;
 
 impl<A, S> Accept<TcpStream, S> for Limited<A>
 where
@@ -234,7 +247,7 @@ where
     A::Service: Send + 'static,
 {
     type Stream = Guarded<A::Stream>;
-    type Service = A::Service;
+    type Service = Tracked<A::Service>;
     type Future = Accepted<A::Stream, A::Service>;
 
     fn accept(&self, stream: TcpStream, service: S) -> Self::Future {
@@ -253,29 +266,183 @@ where
         let accepting = self.inner.accept(stream, service);
         Box::pin(async move {
             let (stream, service) = accepting.await?;
-            Ok((Guarded::new(stream, admitted, deadline), service))
+            // What the service answers is what keeps the stream open.
+            let activity = Activity::new();
+            let service = Tracked {
+                inner: service,
+                activity: activity.clone(),
+            };
+            Ok((Guarded::new(stream, admitted, activity, deadline), service))
         })
     }
 }
 
-/// A connection that holds its room, and has to have said its first
-/// [`FIRST_BYTES`] before its deadline. After that hyper's own deadlines take
-/// over, and this is only a stream.
+/// What one connection is doing: how many of its requests are being answered,
+/// and since when none is.
+struct Activity {
+    doing: Mutex<Doing>,
+}
+
+struct Doing {
+    answering: usize,
+    idle_since: tokio::time::Instant,
+    /// The task reading the connection, woken when the last answer is done:
+    /// its clock starts then, and it would not look otherwise.
+    reader: Option<Waker>,
+}
+
+impl Activity {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            doing: Mutex::new(Doing {
+                answering: 0,
+                idle_since: tokio::time::Instant::now(),
+                reader: None,
+            }),
+        })
+    }
+
+    fn begin(self: &Arc<Self>) -> Answering {
+        self.doing.lock().answering += 1;
+        Answering(self.clone())
+    }
+}
+
+/// One request being answered, until its answer has been sent in full or
+/// given up on.
+pub struct Answering(Arc<Activity>);
+
+impl Drop for Answering {
+    fn drop(&mut self) {
+        let mut doing = self.0.doing.lock();
+        doing.answering -= 1;
+        if doing.answering == 0 {
+            doing.idle_since = tokio::time::Instant::now();
+            if let Some(reader) = doing.reader.take() {
+                reader.wake();
+            }
+        }
+    }
+}
+
+/// The service of one connection, counting what it answers: from the moment
+/// a request arrives until the body of its answer is sent or dropped, so an
+/// event stream counts for as long as it streams.
+#[derive(Clone)]
+pub struct Tracked<S> {
+    inner: S,
+    activity: Arc<Activity>,
+}
+
+impl<S, R, B> Service<Request<R>> for Tracked<S>
+where
+    S: Service<Request<R>, Response = Response<B>>,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+    B: Send + 'static,
+{
+    type Response = Response<Holding<B, Answering>>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, S::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), S::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: Request<R>) -> Self::Future {
+        // Counted before the answer is even started, so there is no moment
+        // in which the connection looks idle while it is not.
+        let answering = self.activity.begin();
+        let answer = self.inner.call(request);
+        Box::pin(async move {
+            let response = answer.await?;
+            Ok(response.map(|body| Holding::new(body, answering)))
+        })
+    }
+}
+
+/// A response body that holds on to something until it has been sent in full
+/// or dropped, not merely until the handler has returned it.
+pub struct Holding<B, T> {
+    body: B,
+    _held: T,
+}
+
+impl<B, T> Holding<B, T> {
+    pub fn new(body: B, held: T) -> Self {
+        Self { body, _held: held }
+    }
+}
+
+impl<B: Body + Unpin, T: Unpin> Body for Holding<B, T> {
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.get_mut().body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
+}
+
+/// A connection that holds its room, has to have said its first
+/// [`FIRST_BYTES`] before its deadline, and ends once it has had nothing to
+/// answer for as long again. Everything else is hyper's.
 pub struct Guarded<S> {
     inner: S,
     _admitted: Admitted,
     /// How much has arrived, and until when the rest may take — until there
     /// has been enough.
     first: Option<(usize, Pin<Box<Sleep>>)>,
+    activity: Arc<Activity>,
+    /// How long it may go without a request being answered, and the clock
+    /// for that.
+    idle_timeout: Duration,
+    idle: Pin<Box<Sleep>>,
 }
 
 impl<S> Guarded<S> {
-    fn new(inner: S, admitted: Admitted, deadline: Duration) -> Self {
+    fn new(inner: S, admitted: Admitted, activity: Arc<Activity>, deadline: Duration) -> Self {
         Self {
             inner,
             _admitted: admitted,
             first: Some((0, Box::pin(tokio::time::sleep(deadline)))),
+            activity,
+            idle_timeout: deadline,
+            idle: Box::pin(tokio::time::sleep(deadline)),
         }
+    }
+
+    /// Whether nothing has been answered here for too long. Pings and
+    /// settings do not count: an HTTP/2 client sends those without anybody
+    /// asking it anything.
+    fn idle_too_long(&mut self, cx: &mut Context<'_>) -> bool {
+        let mut doing = self.activity.doing.lock();
+        if !doing
+            .reader
+            .as_ref()
+            .is_some_and(|reader| reader.will_wake(cx.waker()))
+        {
+            doing.reader = Some(cx.waker().clone());
+        }
+        if doing.answering > 0 {
+            return false;
+        }
+        let until = doing.idle_since + self.idle_timeout;
+        drop(doing);
+        if self.idle.deadline() != until {
+            self.idle.as_mut().reset(until);
+        }
+        self.idle.as_mut().poll(cx).is_ready()
     }
 }
 
@@ -288,25 +455,29 @@ impl<S: AsyncRead + Unpin> AsyncRead for Guarded<S> {
         let this = self.get_mut();
         let before = buf.filled().len();
         let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
-        let Some((seen, deadline)) = this.first.as_mut() else {
-            return polled;
-        };
-        match polled {
-            Poll::Ready(Ok(())) => {
-                *seen += buf.filled().len() - before;
-                if *seen >= FIRST_BYTES {
-                    this.first = None;
+        if let Some((seen, deadline)) = this.first.as_mut() {
+            match polled {
+                Poll::Ready(Ok(())) => {
+                    *seen += buf.filled().len() - before;
+                    if *seen >= FIRST_BYTES {
+                        this.first = None;
+                    }
                 }
+                // Polled here, so the task wakes when time is up even if the
+                // client never sends another byte.
+                Poll::Pending if deadline.as_mut().poll(cx).is_ready() => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "a connection that did not say what it wants in time",
+                    )));
+                }
+                _ => {}
             }
-            // Polled here, so the task wakes when time is up even if the
-            // client never sends another byte.
-            Poll::Pending if deadline.as_mut().poll(cx).is_ready() => {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "a connection that did not say what it wants in time",
-                )));
-            }
-            _ => {}
+        }
+        // Nothing to read, nothing being answered, and for long enough: the
+        // end of the connection, as if the client had closed it.
+        if polled.is_pending() && this.idle_too_long(cx) {
+            return Poll::Ready(Ok(()));
         }
         polled
     }
