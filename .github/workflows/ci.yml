@@ -258,6 +258,8 @@ jobs:
           # An override of one's own, speaking of the service by its old name.
           printf 'services:\n  uwussh:\n    environment:\n      UWUSSH_MAX_ACCOUNTS: "7"\n' |
             sudo tee compose.override.yaml >/dev/null
+          # Written the way an admin would: root's, and writable only by root (the runner's umask is 002).
+          sudo chmod 0644 compose.override.yaml
           sudo docker compose up -d --wait
           sudo docker compose exec -T uwussh uwussh-server fingerprint | head -1 >"$RUNNER_TEMP/before"
           test -s "$RUNNER_TEMP/before"
