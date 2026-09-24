@@ -196,7 +196,13 @@ untrusted() {
   die "$1 may be changed by someone other than root$([ "$admin_uid" != 0 ] && printf ' and you'), and what is in $dir runs as root. $2"
 }
 owned_right "$dir" || untrusted "$dir" "Make it root's and writable only by root: sudo chown root: $dir && sudo chmod go-w $dir"
-for name in compose.yaml .env .uwusync-update .uwussh-update; do
+# Compose lays an override file next to compose.yaml over it by itself, so it runs as root too.
+override_names="compose.override.yaml compose.override.yml docker-compose.override.yaml docker-compose.override.yml"
+overrides=()
+for name in $override_names; do
+  [ -e "$dir/$name" ] && overrides+=("$name")
+done
+for name in compose.yaml .env .uwusync-update .uwussh-update $override_names; do
   [ -e "$dir/$name" ] || [ -L "$dir/$name" ] || continue
   [ -L "$dir/$name" ] && untrusted "$dir/$name" "It is a link; put the file itself there."
   owned_right "$dir/$name" || untrusted "$dir/$name" "sudo chown root: $dir/$name && sudo chmod go-w $dir/$name"
@@ -314,9 +320,12 @@ saved=$(mktemp -d) || die "no room for a temporary directory"
 trap 'rm -f "$dir/.env.tmp"; rm -rf "$saved"' EXIT INT TERM
 cp -p "$dir/.env" "$saved/env"
 cp -p "$dir/compose.yaml" "$saved/compose.yaml"
+for name in "${overrides[@]}"; do cp -p "$dir/$name" "$saved/$name"; done
 put_back() {
+  local name
   cp -p "$saved/env" "$dir/.env"
   cp -p "$saved/compose.yaml" "$dir/compose.yaml"
+  for name in "${overrides[@]}"; do cp -p "$saved/$name" "$dir/$name"; done
 }
 
 # ── what is running now ───────────────────────────────────────────────────────────────────────
@@ -494,6 +503,28 @@ if [ "$old_service" = "$legacy_service" ] && [ "$new_service" != "$legacy_servic
   else
     warn "no data volume from UwUSSH Server found; the server starts with an empty one"
   fi
+  # An override file still speaks of the service by its old name, and Compose would take that for
+  # a second service without an image. The service, its container, its volume and its settings
+  # take the new names there as well; everything else in it stays as it is.
+  for name in "${overrides[@]}"; do
+    install -m 0600 /dev/null "$dir/.env.tmp"
+    awk '
+      /^[^[:space:]#]/ { in_services = ($0 ~ /^services:[[:space:]]*(#.*)?$/); indent = "" }
+      in_services && match($0, /^[[:space:]]+[^[:space:]#-]/) {
+        if (indent == "") indent = substr($0, 1, RLENGTH - 1)
+        if (substr($0, 1, RLENGTH - 1) == indent && $0 ~ "^" indent "[\"'\'']?uwussh[\"'\'']?[[:space:]]*:")
+          sub(/uwussh/, "uwusync")
+      }
+      /^[[:space:]]+container_name:[[:space:]]*["'\'']?uwussh["'\'']?[[:space:]]*(#.*)?$/ { sub(/uwussh/, "uwusync") }
+      /^[[:space:]]+-[[:space:]]*["'\'']?uwussh-data:/ { sub(/uwussh-data/, "uwusync-data") }
+      { gsub(/UWUSSH_/, "UWUSYNC_"); print }
+    ' "$dir/$name" >"$dir/.env.tmp"
+    if ! cmp -s "$dir/.env.tmp" "$dir/$name"; then
+      cat "$dir/.env.tmp" >"$dir/$name"
+      step "  $name speaks of uwusync now as well"
+    fi
+    rm -f "$dir/.env.tmp"
+  done
 elif [ "$old_service" = "$legacy_service" ]; then
   step "compose.yaml still runs UwUSSH Server by its old name, as you keep it; that works"
 fi
@@ -505,6 +536,18 @@ if [ -n "$version" ]; then
     set_env UWUSYNC_VERSION "$version"
   fi
   step "switching to the $version tag"
+fi
+
+# Whether Compose makes sense of all of it — compose.yaml, .env and an override file — before
+# anything is backed up, fetched or stopped.
+if ! problem=$(docker compose config --quiet 2>&1 </dev/null); then
+  put_back
+  printf '%s\n' "$problem" >&2
+  if [ ${#overrides[@]} -gt 0 ]; then
+    warn "Compose does not accept compose.yaml together with ${overrides[*]}."
+    warn "Look at ${overrides[*]} in $dir, then run this again."
+  fi
+  die "nothing was changed"
 fi
 
 # ── a backup first ────────────────────────────────────────────────────────────────────────────
