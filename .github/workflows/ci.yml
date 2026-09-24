@@ -255,6 +255,12 @@ jobs:
           sudo bash "$RUNNER_TEMP/legacy/install.sh" --yes --from-checkout --version 0.1.1 \
             --public localhost
           cd /opt/uwussh
+          # An override of one's own, speaking of the service by its old name.
+          printf 'services:\n  uwussh:\n    environment:\n      UWUSSH_MAX_ACCOUNTS: "7"\n' |
+            sudo tee compose.override.yaml >/dev/null
+          # Written the way an admin would: root's, and writable only by root (the runner's umask is 002).
+          sudo chmod 0644 compose.override.yaml
+          sudo docker compose up -d --wait
           sudo docker compose exec -T uwussh uwussh-server fingerprint | head -1 >"$RUNNER_TEMP/before"
           test -s "$RUNNER_TEMP/before"
       - name: Two new versions, only on this machine
@@ -281,6 +287,7 @@ jobs:
           sudo grep -qx 'UWUSSH_PUBLIC=localhost:8443' /opt/uwussh/.env
           sudo grep -qx 'UWUSSH_VERSION=0.1.1' /opt/uwussh/.env
           sudo grep -q 'uwussh-server' /opt/uwussh/compose.yaml
+          sudo grep -qx '  uwussh:' /opt/uwussh/compose.override.yaml
       - name: The move, with the same data and the same key
         run: |
           sudo bash update.sh --dir /opt/uwussh --yes --no-pull --no-self-update \
@@ -294,6 +301,8 @@ jobs:
           sudo grep -qx 'UWUSYNC_VERSION=0.0.2' .env
           sudo grep -qx 'UWUSYNC_VOLUME=uwussh_uwussh-data' .env
           if sudo grep -q '^UWUSSH_' .env; then exit 1; fi
+          sudo grep -qx '  uwusync:' compose.override.yaml
+          sudo docker inspect uwusync --format '{{.Config.Env}}' | grep -q 'UWUSYNC_MAX_ACCOUNTS=7'
           test -f .uwusync-update && test ! -e .uwussh-update
           after=$(sudo docker compose exec -T uwusync uwusync-server fingerprint | head -1)
           test "$(cat "$RUNNER_TEMP/before")" = "$after"
